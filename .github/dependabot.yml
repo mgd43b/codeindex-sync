@@ -17,6 +17,13 @@ updates:
         update-types: [minor, patch]
     # Majors stay separate: they need a human to read the changelog.
     labels: [dependencies]
+    ignore:
+      # @types/node must track the MINIMUM supported runtime (engines: >=20),
+      # not the newest release. Newer types let tsc accept APIs that do not
+      # exist on Node 20 and crash there at runtime — a failure CI cannot see,
+      # because it type-checks once against whatever version is installed.
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
 
   - package-ecosystem: github-actions
     directory: "/"
