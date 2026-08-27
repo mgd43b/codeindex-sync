@@ -39,8 +39,16 @@ import {
 } from "./install.js";
 import { WorkerLock } from "./lock.js";
 import { Logger } from "./logger.js";
-import { resolvePaths } from "./paths.js";
+import { isUnder, resolvePaths } from "./paths.js";
 import { PRESETS, findPreset } from "./presets.js";
+import {
+  DEFAULT_INTERVAL,
+  detectScheduler,
+  installSchedule,
+  removeSchedule,
+  resolveBinary,
+  scheduleInstalled,
+} from "./schedule.js";
 import { ProviderRegistry } from "./provider.js";
 import { McpIndexProvider } from "./providers/mcp-provider.js";
 import { Queue, nowIso } from "./queue.js";
@@ -193,6 +201,21 @@ program
         );
         problems++;
       }
+    }
+
+    ui.heading("Scheduling");
+    if (detectScheduler() === "unsupported") {
+      ui.info("no supported scheduler here — run `codeindex-sync drain` yourself");
+    } else if (scheduleInstalled()) {
+      ui.ok("a timer is draining the queue");
+    } else {
+      // Everything else can look perfect while nothing is ever indexed, because
+      // hooks only enqueue. This is the most common "it silently does nothing".
+      ui.warn(
+        "nothing drains the queue — hooks enqueue but never index inline",
+        `run ${ui.style.cyan("codeindex-sync schedule")}`,
+      );
+      problems++;
     }
 
     ui.heading("Backends");
@@ -757,6 +780,114 @@ function pruneGoneWorktrees(repo: string, apply: boolean): void {
   ui.line();
   ui.ok(`${removed} of ${candidates.length} removed`);
 }
+
+// ── completion ────────────────────────────────────────────────────────────
+/**
+ * Completion scripts are generated from commander's own command list rather
+ * than a hand-written array, so a new command is completable the moment it
+ * exists. A list that drifts out of date is worse than none: it teaches the
+ * wrong names.
+ */
+function completionScript(shell: string, commands: string[]): string {
+  const words = commands.join(" ");
+  if (shell === "bash") {
+    return `# codeindex-sync bash completion
+_codeindex_sync() {
+  local cur="\${COMP_WORDS[COMP_CWORD]}"
+  if [ "\$COMP_CWORD" -eq 1 ]; then
+    COMPREPLY=( \$(compgen -W "${words}" -- "\$cur") )
+  else
+    COMPREPLY=( \$(compgen -d -- "\$cur") )
+  fi
+}
+complete -F _codeindex_sync codeindex-sync
+`;
+  }
+  if (shell === "zsh") {
+    return `#compdef codeindex-sync
+# codeindex-sync zsh completion
+_codeindex_sync() {
+  local -a cmds
+  cmds=(${commands.map((c) => `'${c}'`).join(" ")})
+  if (( CURRENT == 2 )); then
+    _describe 'command' cmds
+  else
+    _files -/
+  fi
+}
+compdef _codeindex_sync codeindex-sync
+`;
+  }
+  return `# codeindex-sync fish completion
+${commands
+  .map((c) => `complete -c codeindex-sync -n __fish_use_subcommand -a ${c}`)
+  .join("\n")}
+`;
+}
+
+program
+  .command("completion [shell]")
+  .description("Print a shell completion script (bash, zsh or fish)")
+  .action((shell: string | undefined) => {
+    const target = (shell ?? process.env["SHELL"]?.split("/").pop() ?? "bash").toLowerCase();
+    if (!["bash", "zsh", "fish"].includes(target)) {
+      ui.fail(`unknown shell "${target}"`, "supported: bash, zsh, fish");
+    }
+    const commands = program.commands
+      .map((c) => c.name())
+      .filter((n) => n !== "help")
+      .sort();
+    process.stdout.write(completionScript(target, commands));
+  });
+
+// ── schedule / unschedule ─────────────────────────────────────────────────
+program
+  .command("schedule")
+  .description("Drain the queue automatically on a timer (launchd or systemd)")
+  .option("--interval <seconds>", "how often to drain", String(DEFAULT_INTERVAL))
+  .action((opts: { interval: string }) => {
+    const interval = Number.parseInt(opts.interval, 10);
+    if (!Number.isFinite(interval) || interval < 10) {
+      ui.fail("--interval must be a number of seconds, at least 10", "e.g. --interval 120");
+    }
+    const binary = resolveBinary();
+    if (!path.isAbsolute(binary)) {
+      // A bare name resolves at the terminal but not under a scheduler, which
+      // looks configured while doing nothing.
+      ui.fail(
+        `cannot determine an absolute path for the binary (got "${binary}")`,
+        "install it globally first: npm install -g codeindex-sync",
+      );
+    }
+    const res = installSchedule(binary, interval);
+    if (res.scheduler === "unsupported") {
+      ui.bad("no supported scheduler on this platform", "run `codeindex-sync drain` yourself");
+      process.exitCode = 1;
+      return;
+    }
+    ui.heading(`Scheduled via ${res.scheduler}`);
+    for (const f of res.files) ui.ok(f);
+    ui.ok(`draining every ${interval}s using ${binary}`);
+    if (!res.loaded) {
+      ui.warn("written but not activated", res.hint ?? "load it yourself");
+      process.exitCode = 1;
+      return;
+    }
+    ui.line();
+    ui.line(`  ${ui.style.dim("undo:")} ${ui.style.cyan("codeindex-sync unschedule")}`);
+  });
+
+program
+  .command("unschedule")
+  .description("Stop draining on a timer")
+  .action(() => {
+    const res = removeSchedule();
+    if (res.removed.length === 0) {
+      ui.info("nothing scheduled");
+      return;
+    }
+    for (const f of res.removed) ui.ok(`removed ${f}`);
+  });
 
 // ── cleanup ───────────────────────────────────────────────────────────────
 program

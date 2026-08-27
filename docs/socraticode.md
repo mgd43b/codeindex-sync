@@ -179,44 +179,29 @@ Queue
 Anything broken comes with the command that fixes it. `watching` is the root
 below which repos are considered — see the troubleshooting note about it.
 
-## 6. Drain the queue
+## 6. Drain the queue automatically
 
 Hooks *enqueue*; they never index inline, because a git command must not wait on
-a backend. Something has to drain the queue.
+a backend. Something has to drain the queue:
 
-Run it by hand:
+```bash
+codeindex-sync schedule
+```
+
+That writes and loads a LaunchAgent on macOS, or a systemd user timer on Linux,
+draining every 120 seconds (`--interval` to change it). `codeindex-sync
+unschedule` removes it.
+
+It records the *absolute* path to the binary, because a scheduler does not
+inherit your shell's `PATH` — the same reason git hooks do not. If the binary
+isn't installed globally yet, the command says so rather than writing a unit
+that would silently never run.
+
+To drain by hand instead:
 
 ```bash
 codeindex-sync drain
 ```
-
-…or on a timer. macOS, `~/Library/LaunchAgents/dev.codeindex.sync.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>dev.codeindex.sync</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/local/bin/codeindex-sync</string>
-    <string>drain</string>
-  </array>
-  <key>StartInterval</key><integer>120</integer>
-  <key>RunAtLoad</key><true/>
-</dict></plist>
-```
-
-```bash
-launchctl load ~/Library/LaunchAgents/dev.codeindex.sync.plist
-```
-
-Use `which codeindex-sync` for the path — a LaunchAgent does not inherit your
-shell's `PATH`, for the same reason git hooks do not.
-
-Linux, `~/.config/systemd/user/codeindex-sync.timer` plus a matching
-`.service` running `codeindex-sync drain`, is the equivalent.
 
 Draining concurrently is safe: the worker takes a lock and a second run exits
 immediately.
@@ -226,10 +211,36 @@ immediately.
 ```bash
 codeindex-sync status              # queue, worker, failures
 codeindex-sync list                # what the backend knows about this repo
+codeindex-sync list --all --stale  # every index, orphans only
 codeindex-sync sync --full         # force a complete reindex
-codeindex-sync log 40              # what the worker has been doing
-codeindex-sync worktrees --prune   # drop dangling worktree registrations
+codeindex-sync log 40 -f           # follow the worker log
+codeindex-sync cleanup             # indexes whose directory is gone (dry run)
+codeindex-sync worktrees --gone    # worktrees whose branch was merged (dry run)
 ```
+
+`cleanup` and `worktrees --gone` are dry runs until you add `--apply`.
+
+## Repositories that manage their own hooks
+
+If a repo sets its own `core.hooksPath` — husky, lefthook, a `.githooks`
+convention — that **overrides** the global one, so the global dispatcher never
+runs there. `doctor` reports it, and the fix is:
+
+```bash
+codeindex-sync install-repo
+```
+
+This takes over that repo's `core.hooksPath` and chains whatever it pointed at,
+so husky keeps working. Nothing is written inside the repository, and
+`codeindex-sync uninstall-repo` puts the original back.
+
+## Shell completion
+
+```bash
+codeindex-sync completion zsh > ~/.zsh/completions/_codeindex-sync
+```
+
+`bash` and `fish` work too.
 
 ## When something looks wrong
 

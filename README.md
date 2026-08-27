@@ -14,14 +14,14 @@ commands:
 npm install -g codeindex-sync
 codeindex-sync init --preset socraticode   # configure a backend
 codeindex-sync install                     # install the git hooks
+codeindex-sync schedule                    # drain the queue on a timer
 codeindex-sync doctor                      # check it all works
 ```
 
-Two steps people miss, both covered in the guides below: backend URLs go in the
-config's `env` block (git hooks are not a login shell, so your exported
-variables are invisible to the indexer), and something has to **drain the
-queue** — hooks enqueue but never index inline, so a git command never waits on
-a backend.
+One step people miss: backend URLs go in the config's `env` block, not your
+shell — git hooks are not a login shell, so exported variables are invisible to
+the indexer, which then writes somewhere nothing reads. `doctor` checks the
+rest, including whether anything is actually draining the queue.
 
 **Guides:** [Using it with SocratiCode](docs/socraticode.md) ·
 [Adding a backend or hook handler](docs/extending.md)
@@ -56,7 +56,11 @@ behaviour here comes from a failure seen in production:
 | `retry` / `forget` | Manage failed jobs |
 | `unlock [--force]` | Release a stale worker lock |
 | `providers [--example]` | Configured providers and available presets |
-| `worktrees [--prune]` | Inspect worktrees; drop dangling registrations |
+| `worktrees [--prune\|--gone]` | Inspect worktrees; drop dangling registrations or merged ones |
+| `cleanup [--apply]` | Remove indexes whose directory is gone (dry run by default) |
+| `schedule` / `unschedule` | Drain the queue on a timer (launchd or systemd) |
+| `install-repo` / `uninstall-repo` | Cover a repo that sets its own `core.hooksPath` |
+| `completion [shell]` | Shell completion for bash, zsh or fish |
 | `hook <name>` | Entry point for git hooks (enqueues; never indexes inline) |
 
 ## Backends

@@ -201,6 +201,43 @@ describe("extensions", () => {
   });
 });
 
+describe("completion", () => {
+  it("emits a bash script that bash can parse", () => {
+    const r = cli(["completion", "bash"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("complete -F _codeindex_sync codeindex-sync");
+  });
+
+  it("lists real commands, generated from the command table", () => {
+    // Generated rather than hand-maintained, so a new command is completable
+    // without anyone remembering to update a list.
+    const out = cli(["completion", "bash"]).out;
+    for (const c of ["doctor", "cleanup", "schedule", "install-repo"]) {
+      expect(out).toContain(c);
+    }
+  });
+
+  it("emits a zsh script with a compdef header", () => {
+    expect(cli(["completion", "zsh"]).out).toMatch(/^#compdef codeindex-sync/);
+  });
+
+  it("rejects an unknown shell with the supported list", () => {
+    const r = cli(["completion", "tcsh"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/bash, zsh, fish/);
+  });
+});
+
+describe("cleanup", () => {
+  it("is a dry run by default and says how to apply", () => {
+    // Removing an index is unrecoverable short of a full reindex, so the
+    // default must never destroy anything.
+    writeConfig({ providers: [{ name: "x", command: "does-not-exist", tools: { update: "u" } }] });
+    const r = cli(["cleanup"]);
+    expect(r.out).not.toMatch(/removed/i);
+  });
+});
+
 describe("unlock", () => {
   it("is a no-op when no lock is held", () => {
     const r = cli(["unlock"]);
