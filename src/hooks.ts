@@ -26,6 +26,45 @@ export const GIT_HOOKS = [
   "post-applypatch",
 ] as const;
 
+/**
+ * Every hook type a dispatcher must exist for — not just the ones we act on.
+ *
+ * `core.hooksPath` REPLACES a repository's `.git/hooks` wholesale. Git looks
+ * only in that directory, so a hook type with no file there simply never runs:
+ * install this tool with five hooks and every repo on the machine silently
+ * loses its pre-commit, commit-msg and pre-push. Nothing errors, and the loss
+ * is invisible until something unvalidated reaches main.
+ *
+ * So a dispatcher is installed for all of these. The five above additionally
+ * enqueue; the rest only chain the repo's own hook and get out of the way.
+ *
+ * Deliberately excluded: `fsmonitor-watchman` (invoked with a protocol, not
+ * hook semantics), `reference-transaction` (fires many times per command, and
+ * chaining it would tax every git operation), and the `p4-*` family.
+ */
+export const ALL_GIT_HOOKS = [
+  "applypatch-msg",
+  "commit-msg",
+  "post-applypatch",
+  "post-checkout",
+  "post-commit",
+  "post-index-change",
+  "post-merge",
+  "post-receive",
+  "post-rewrite",
+  "post-update",
+  "pre-applypatch",
+  "pre-auto-gc",
+  "pre-commit",
+  "pre-merge-commit",
+  "pre-push",
+  "pre-rebase",
+  "pre-receive",
+  "prepare-commit-msg",
+  "sendemail-validate",
+  "update",
+] as const;
+
 export type GitHook = (typeof GIT_HOOKS)[number];
 
 export function isGitHook(name: string): name is GitHook {

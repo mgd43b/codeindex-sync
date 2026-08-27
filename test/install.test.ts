@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { GIT_HOOKS } from "../src/hooks.js";
+import { ALL_GIT_HOOKS, GIT_HOOKS } from "../src/hooks.js";
 import { MARKER, dispatcherScript, installDispatcher, isOurHooksDir } from "../src/install.js";
 
 let dir: string;
@@ -57,8 +57,8 @@ describe("dispatcherScript", () => {
 describe("installDispatcher", () => {
   it("installs every supported hook, executable", () => {
     const res = installDispatcher(dir);
-    expect(res.installed).toEqual([...GIT_HOOKS]);
-    for (const hook of GIT_HOOKS) {
+    expect(res.installed).toEqual([...ALL_GIT_HOOKS]);
+    for (const hook of ALL_GIT_HOOKS) {
       const file = path.join(dir, hook);
       expect(readFileSync(file, "utf8")).toContain(MARKER);
       // Owner-executable, or git silently ignores the hook.
@@ -122,5 +122,42 @@ describe("dispatcher behaviour in a real repo", () => {
     // The repo's own hook still ran despite hooksPath being redirected.
     expect(readFileSync(evidence, "utf8").trim()).toBe("ran");
     rmSync(repo, { recursive: true, force: true });
+  });
+});
+
+describe("hook coverage (core.hooksPath replaces .git/hooks entirely)", () => {
+  it("installs a dispatcher for every hook type, not just the indexing ones", () => {
+    // Verified by experiment: with a hooksPath containing only post-commit, a
+    // repo's own pre-commit never runs and nothing reports it. Installing this
+    // tool would then silently disable validation in every repo on the machine.
+    const dir = mkdtempSync(path.join(tmpdir(), "codeindex-cover-"));
+    const res = installDispatcher(dir);
+    for (const hook of ALL_GIT_HOOKS) {
+      expect(res.installed).toContain(hook);
+      expect(existsSync(path.join(dir, hook))).toBe(true);
+    }
+    expect(res.installed.length).toBe(ALL_GIT_HOOKS.length);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("covers every hook the indexing set needs", () => {
+    for (const hook of GIT_HOOKS) expect(ALL_GIT_HOOKS).toContain(hook);
+  });
+
+  it("only the indexing hooks invoke the binary", () => {
+    // A pre-commit that spawns node on every commit would tax every repo for
+    // nothing: those hooks exist purely to chain.
+    expect(dispatcherScript("codeindex-sync", true)).toContain("codeindex-sync hook");
+    expect(dispatcherScript("codeindex-sync", false)).not.toContain("codeindex-sync hook");
+  });
+
+  it("chains the repo's own hook in both variants", () => {
+    for (const enqueue of [true, false]) {
+      const script = dispatcherScript("codeindex-sync", enqueue);
+      expect(script).toContain('"$local_hook" "$@"');
+      // The repo hook's exit status must propagate, or a failing pre-commit
+      // stops vetoing the commit.
+      expect(script).toContain("exit $?");
+    }
   });
 });

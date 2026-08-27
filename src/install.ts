@@ -15,7 +15,7 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
-import { GIT_HOOKS } from "./hooks.js";
+import { ALL_GIT_HOOKS, GIT_HOOKS } from "./hooks.js";
 import { localHooksPath, resolveHooksPath, setLocalHooksPath, unsetLocalHooksPath } from "./git.js";
 
 export const MARKER = "# codeindex-sync dispatcher";
@@ -37,7 +37,17 @@ export function defaultHooksDir(): string {
 // sigil keeps the rule "shell $ is always escaped" rather than the far more
 // error-prone "escape only when it currently matters".
 /* eslint-disable no-useless-escape */
-export function dispatcherScript(binary = "codeindex-sync"): string {
+export function dispatcherScript(binary = "codeindex-sync", enqueue = true): string {
+  const enqueueBlock = enqueue
+    ? `
+# 2. Enqueue. Never blocks: the worker does the actual indexing.
+if command -v ${binary} >/dev/null 2>&1; then
+  ${binary} hook "\$hook_name" "\$@" >/dev/null 2>&1 || true
+fi`
+    : `
+# This hook type is not an indexing trigger. The dispatcher exists purely so the
+# repository's own hook still runs: core.hooksPath replaces .git/hooks, so
+# without a file here git would run nothing at all.`;
   return `#!/bin/sh
 ${MARKER}
 # Installed by \`codeindex-sync install\`. Safe to inspect; edits will be
@@ -55,10 +65,7 @@ if [ -x "\$local_hook" ]; then
   "\$local_hook" "\$@" || exit \$?
 fi
 
-# 2. Enqueue. Never blocks: the worker does the actual indexing.
-if command -v ${binary} >/dev/null 2>&1; then
-  ${binary} hook "\$hook_name" "\$@" >/dev/null 2>&1 || true
-fi
+${enqueueBlock}
 exit 0
 `;
 }
@@ -86,11 +93,12 @@ export function installDispatcher(
   chmodSync(dispatcher, 0o755);
 
   const installed: string[] = [];
-  for (const hook of GIT_HOOKS) {
+  const indexing = new Set<string>(GIT_HOOKS);
+  for (const hook of ALL_GIT_HOOKS) {
     const target = path.join(hooksDir, hook);
     // A copy rather than a symlink: symlinks in hooksDir behave inconsistently
     // across git versions and filesystems.
-    writeFileSync(target, dispatcherScript(binary), "utf8");
+    writeFileSync(target, dispatcherScript(binary, indexing.has(hook)), "utf8");
     chmodSync(target, 0o755);
     installed.push(hook);
   }
@@ -132,7 +140,14 @@ export function repoSlug(repo: string): string {
 const ORIGINAL = ".original-hooks-path";
 
 /* eslint-disable no-useless-escape */
-export function repoDispatcherScript(binary: string, chainDir: string): string {
+export function repoDispatcherScript(binary: string, chainDir: string, enqueue = true): string {
+  const enqueueBlock = enqueue
+    ? `
+if command -v ${binary} >/dev/null 2>&1; then
+  ${binary} hook "\$hook_name" "\$@" >/dev/null 2>&1 || true
+fi`
+    : `
+# Not an indexing trigger; this exists only so the repo's own hook still runs.`;
   return `#!/bin/sh
 ${MARKER} (repo-scoped)
 # Installed by \`codeindex-sync install-repo\`. This repository sets its own
@@ -152,9 +167,7 @@ if [ -n "\$chained" ]; then
   fi
 fi
 
-if command -v ${binary} >/dev/null 2>&1; then
-  ${binary} hook "\$hook_name" "\$@" >/dev/null 2>&1 || true
-fi
+${enqueueBlock}
 exit 0
 `;
 }
@@ -191,9 +204,10 @@ export function installRepoDispatcher(
 
   // With no previous hooksPath, the repo was using .git/hooks; keep honouring it.
   const chainTarget = chained ?? path.join(repo, ".git", "hooks");
-  for (const hook of GIT_HOOKS) {
+  const indexing = new Set<string>(GIT_HOOKS);
+  for (const hook of ALL_GIT_HOOKS) {
     const target = path.join(dir, hook);
-    writeFileSync(target, repoDispatcherScript(binary, chainTarget), "utf8");
+    writeFileSync(target, repoDispatcherScript(binary, chainTarget, indexing.has(hook)), "utf8");
     chmodSync(target, 0o755);
   }
   setLocalHooksPath(repo, dir);
