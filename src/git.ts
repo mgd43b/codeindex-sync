@@ -151,3 +151,23 @@ export function unsetLocalHooksPath(repo: string): void {
 export function resolveHooksPath(repo: string, value: string): string {
   return path.isAbsolute(value) ? value : path.join(repo, value);
 }
+
+/** Does this worktree have uncommitted changes? Never remove one that does. */
+export function worktreeDirty(dir: string): boolean {
+  return isDirty(dir);
+}
+
+/**
+ * Remove a linked worktree and delete its branch.
+ *
+ * Refuses the main worktree — `git worktree remove` would too, but failing
+ * loudly here keeps the caller's dry-run listing honest.
+ */
+export function removeWorktree(repo: string, dir: string, force = false): boolean {
+  const args = ["worktree", "remove", ...(force ? ["--force"] : []), dir];
+  return git(args, repo) !== null;
+}
+
+export function deleteBranch(repo: string, branch: string): boolean {
+  return git(["branch", "-D", branch], repo) !== null;
+}

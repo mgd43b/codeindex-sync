@@ -9,6 +9,7 @@
  * see `presets.ts` for ready-made ones.
  */
 import { existsSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { withMcp, type McpToolResult } from "../mcp.js";
 import type {
@@ -32,6 +33,10 @@ export interface McpProviderConfig {
     index?: string;
     status?: string;
     health?: string;
+    /** Enumerate every index the backend holds; enables `list --all`/`cleanup`. */
+    list?: string;
+    /** Drop one index; enables `cleanup --apply`. */
+    remove?: string;
   };
   /** Argument name carrying the repo path (servers differ). */
   repoArg?: string;
@@ -48,6 +53,28 @@ export interface McpProviderConfig {
    * the job should be requeued, not counted as a failed attempt.
    */
   busyMarkers?: string[];
+}
+
+/**
+ * A directory that definitely exists, preferring `wanted`.
+ *
+ * Spawning with a cwd that has been deleted fails during interpreter startup
+ * with an opaque `uv_cwd ENOENT`, long before the backend gets a chance to
+ * report anything useful. Deleted directories are routine here: throwaway
+ * worktrees, and `cleanup`, whose entire input is paths that no longer exist.
+ */
+function safeCwd(wanted?: string): string {
+  const candidates = [wanted, process.cwd(), homedir(), tmpdir()].filter(
+    (c): c is string => typeof c === "string" && c.length > 0,
+  );
+  for (const c of candidates) {
+    try {
+      if (existsSync(c)) return c;
+    } catch {
+      // Unreadable: try the next one.
+    }
+  }
+  return tmpdir();
 }
 
 const DEFAULT_BUSY_MARKERS = ["another indexer", "already in progress", "locked by", "BUSY"];
@@ -103,9 +130,12 @@ export class McpIndexProvider implements IndexProvider {
       {
         command: this.cfg.command,
         args: this.cfg.args,
-        // Always the repo: inheriting a hook's cwd is how the runtime ends up
+        // Prefer the repo: inheriting a hook's cwd is how the runtime ends up
         // starting in a deleted worktree and dying before the backend loads.
-        cwd: repoPath,
+        // But the repo is not always there — `cleanup` acts on paths that are
+        // gone by definition — so fall back to somewhere that exists rather
+        // than spawning into ENOENT.
+        cwd: safeCwd(repoPath),
         env: { ...process.env, ...this.cfg.env },
         ...(this.cfg.timeoutMs === undefined ? {} : { timeoutMs: this.cfg.timeoutMs }),
       },
@@ -161,6 +191,53 @@ export class McpIndexProvider implements IndexProvider {
     }
   }
 
+  /**
+   * Every project this backend holds an index for.
+   *
+   * Parsing is deliberately generic: any "list projects" tool prints paths, so
+   * lines that are *just* a path (optionally bulleted) are taken and everything
+   * else ignored. That tolerates differing formats without teaching this class
+   * about any particular backend. A path containing a newline would be missed;
+   * no filesystem in practice has one.
+   */
+  async projects(): Promise<string[] | null> {
+    const tool = this.cfg.tools.list;
+    if (!tool) return null;
+    try {
+      const res = await withMcp(
+        {
+          command: this.cfg.command,
+          args: this.cfg.args,
+          cwd: safeCwd(),
+          env: { ...process.env, ...this.cfg.env },
+          timeoutMs: this.cfg.timeoutMs ?? 30_000,
+        },
+        (s) => s.callTool(tool, {}),
+      );
+      if (res.isError) return null;
+      const out: string[] = [];
+      for (const line of res.text.split("\n")) {
+        const m = /^\s*(?:[-*\u2022]\s*)?(\/.*\S)\s*$/.exec(line);
+        if (m?.[1]) out.push(m[1]);
+      }
+      return [...new Set(out)];
+    } catch {
+      return null;
+    }
+  }
+
+  /** Drop one index. Returns false when the backend cannot do this. */
+  async remove(repoPath: string): Promise<boolean> {
+    const tool = this.cfg.tools.remove;
+    if (!tool) return false;
+    try {
+      const res = await this.call(repoPath, tool, this.repoArgs(repoPath));
+      return !res.isError;
+    } catch {
+      return false;
+    }
+  }
+
   async health(): Promise<ProviderHealth[]> {
     // Reachability is the only backend-agnostic health signal: can we spawn it
     // and complete a handshake? Anything more specific belongs to the backend.
@@ -170,7 +247,7 @@ export class McpIndexProvider implements IndexProvider {
         {
           command: this.cfg.command,
           args: this.cfg.args,
-          cwd: probeDir,
+          cwd: safeCwd(probeDir),
           env: { ...process.env, ...this.cfg.env },
           timeoutMs: this.cfg.timeoutMs ?? 30_000,
         },

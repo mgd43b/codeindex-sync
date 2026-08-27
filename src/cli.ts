@@ -12,14 +12,18 @@
  *  4. A user never sees a stack trace.
  */
 import { Command } from "commander";
-import { existsSync, readFileSync } from "node:fs";
+import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
 import path from "node:path";
 import { ConfigError, configPath, loadConfig, saveConfig, type Config } from "./config.js";
 import {
+  deleteBranch,
   globalHooksPath,
+  goneBranches,
+  isDirty,
   listWorktrees,
   mainWorktree,
   pruneWorktrees,
+  removeWorktree,
   repoRoot,
   setGlobalHooksPath,
   unsetGlobalHooksPath,
@@ -274,12 +278,21 @@ program
 program
   .command("list [repo]")
   .description("Show what each provider knows about a repository")
-  .action(async (repo: string | undefined) => {
+  .option("--all", "every index the backend holds, not just this repo", false)
+  .option("--stale", "with --all, only rows needing attention", false)
+  .option("--json", "machine-readable output", false)
+  .option("--sort <key>", "with --all: path (default) or name", "path")
+  .action(async (repo: string | undefined, opts: ListOpts) => {
     const cfg = config();
     requireProviders(cfg);
+    if (opts.all) {
+      await listAll(cfg, opts);
+      return;
+    }
     const target = resolveRepo(repo ?? process.cwd());
     ui.heading(path.basename(target));
     const rows: string[][] = [];
+    const json: Record<string, unknown>[] = [];
     for (const provider of registryFrom(cfg).all()) {
       if (!(await provider.detect(target))) {
         rows.push([ui.style.dim(provider.name), ui.style.dim("does not claim this repo"), ""]);
@@ -302,6 +315,17 @@ program
         .filter(Boolean)
         .join(", ");
       rows.push([ui.style.cyan(provider.name), state, detail]);
+      json.push({
+        provider: provider.name,
+        indexed: status.indexed,
+        incomplete: status.incomplete ?? false,
+        ...(status.files === undefined ? {} : { files: status.files }),
+        ...(status.chunks === undefined ? {} : { chunks: status.chunks }),
+      });
+    }
+    if (opts.json) {
+      process.stdout.write(JSON.stringify({ repo: target, providers: json }, null, 2) + "\n");
+      return;
     }
     ui.table(rows);
     if (rows.some((r) => ui.stripAnsi(r[1] ?? "").includes("incomplete"))) {
@@ -317,19 +341,47 @@ program
 program
   .command("log [lines]")
   .description("Show the worker log")
-  .action((lines: string | undefined) => {
+  .option("-f, --follow", "keep printing as the worker writes", false)
+  .action((lines: string | undefined, opts: { follow: boolean }) => {
     const file = resolvePaths().log;
-    if (!existsSync(file)) {
+    if (!existsSync(file) && !opts.follow) {
       ui.empty("no log yet", "codeindex-sync sync <repo>");
       return;
     }
     const n = Number.parseInt(lines ?? "40", 10);
-    const all = readFileSync(file, "utf8").split("\n").filter(Boolean);
-    if (all.length === 0) {
-      ui.empty("log is empty");
-      return;
+    if (existsSync(file)) {
+      const all = readFileSync(file, "utf8").split("\n").filter(Boolean);
+      if (all.length === 0 && !opts.follow) {
+        ui.empty("log is empty");
+        return;
+      }
+      for (const l of all.slice(-(Number.isFinite(n) ? n : 40))) ui.line(`  ${l}`);
     }
-    for (const l of all.slice(-(Number.isFinite(n) ? n : 40))) ui.line(`  ${l}`);
+    if (!opts.follow) return;
+
+    // Polling rather than fs.watch: the log is rotated (renamed) rather than
+    // truncated, and watch semantics for a replaced inode differ per platform.
+    // Tracking size, and resetting when it shrinks, survives rotation anywhere.
+    let offset = existsSync(file) ? statSync(file).size : 0;
+    const tick = (): void => {
+      if (!existsSync(file)) return;
+      const size = statSync(file).size;
+      if (size < offset) offset = 0; // rotated
+      if (size === offset) return;
+      const fd = openSync(file, "r");
+      const buf = Buffer.alloc(size - offset);
+      readSync(fd, buf, 0, buf.length, offset);
+      closeSync(fd);
+      offset = size;
+      for (const l of buf.toString("utf8").split("\n").filter(Boolean)) ui.line(`  ${l}`);
+    };
+    const timer = setInterval(tick, 500);
+    const stop = (): void => {
+      clearInterval(timer);
+      process.exit(0);
+    };
+    process.on("SIGINT", stop);
+    process.on("SIGTERM", stop);
   });
 
 // ── sync ──────────────────────────────────────────────────────────────────
@@ -482,8 +534,14 @@ program
   .command("worktrees [repo]")
   .description("Show worktrees and prune dangling registrations")
   .option("--prune", "remove registrations whose directory is gone", false)
-  .action((repo: string | undefined, opts: { prune: boolean }) => {
+  .option("--gone", "remove worktrees whose upstream branch was deleted", false)
+  .option("--apply", "with --gone, actually remove them (default: dry run)", false)
+  .action((repo: string | undefined, opts: { prune: boolean; gone: boolean; apply: boolean }) => {
     const target = resolveRepo(repo ?? process.cwd());
+    if (opts.gone) {
+      pruneGoneWorktrees(target, opts.apply);
+      return;
+    }
     if (opts.prune) {
       const before = listWorktrees(target).length;
       pruneWorktrees(target, "now");
@@ -567,6 +625,184 @@ program
   });
 
 // ── hook entry point ──────────────────────────────────────────────────────
+interface ListOpts {
+  all: boolean;
+  stale: boolean;
+  json: boolean;
+  sort: string;
+}
+
+/** One row of "what does the backend hold, and does it still exist on disk?" */
+interface ProjectRow {
+  provider: string;
+  path: string;
+  exists: boolean;
+}
+
+/**
+ * Every index across every provider, paired with whether its directory is
+ * still there. Shared by `list --all` and `cleanup`, so the two can never
+ * disagree about what is orphaned.
+ */
+async function collectProjects(cfg: Config): Promise<{ rows: ProjectRow[]; unsupported: string[] }> {
+  const rows: ProjectRow[] = [];
+  const unsupported: string[] = [];
+  for (const provider of registryFrom(cfg).all()) {
+    const paths = provider.projects ? await provider.projects() : null;
+    if (paths === null) {
+      unsupported.push(provider.name);
+      continue;
+    }
+    for (const p of paths) rows.push({ provider: provider.name, path: p, exists: existsSync(p) });
+  }
+  return { rows, unsupported };
+}
+
+async function listAll(cfg: Config, opts: ListOpts): Promise<void> {
+  const { rows, unsupported } = await collectProjects(cfg);
+  const shown = (opts.stale ? rows.filter((r) => !r.exists) : rows).sort((a, b) =>
+    opts.sort === "name"
+      ? path.basename(a.path).localeCompare(path.basename(b.path))
+      : a.path.localeCompare(b.path),
+  );
+
+  if (opts.json) {
+    process.stdout.write(JSON.stringify({ projects: shown, unsupported }, null, 2) + "\n");
+    return;
+  }
+  ui.heading(opts.stale ? "Indexes needing attention" : "All indexes");
+  if (shown.length === 0) {
+    ui.empty(opts.stale ? "nothing stale" : "no indexes reported");
+  } else {
+    ui.table(
+      shown.map((r) => [
+        ui.style.cyan(r.provider),
+        r.exists ? ui.style.green("on disk") : ui.style.red("gone"),
+        r.path,
+      ]),
+    );
+  }
+  for (const name of unsupported) {
+    ui.info(`${name} cannot enumerate indexes (no \`tools.list\` configured)`);
+  }
+  const gone = rows.filter((r) => !r.exists).length;
+  if (gone > 0 && !opts.stale) {
+    ui.line();
+    ui.warn(
+      `${gone} index(es) point at directories that no longer exist`,
+      `review with ${ui.style.cyan("codeindex-sync cleanup")}`,
+    );
+  }
+}
+
+/**
+ * Remove worktrees whose upstream branch is gone — the worktree analogue of
+ * deleting "[gone]" branches after a squash-merge.
+ *
+ * Squash merges are why ancestry cannot be used to decide this: the commits
+ * never appear in the target branch, so a merged worktree looks unmerged
+ * forever. A deleted upstream is the signal that actually fires.
+ *
+ * Three things are never touched, because each can hold work that exists
+ * nowhere else: the main worktree, a detached HEAD, and anything with
+ * uncommitted changes. Dry run unless --apply.
+ */
+function pruneGoneWorktrees(repo: string, apply: boolean): void {
+  const main = mainWorktree(repo) ?? repo;
+  const gone = new Set(goneBranches(main));
+  const trees = listWorktrees(main);
+
+  const candidates: { path: string; branch: string }[] = [];
+  const skipped: string[][] = [];
+  for (const t of trees) {
+    if (path.resolve(t.path) === path.resolve(main)) continue;
+    if (!t.branch) {
+      skipped.push([ui.style.dim(path.basename(t.path)), ui.style.dim("detached HEAD")]);
+      continue;
+    }
+    if (!gone.has(t.branch)) continue;
+    if (existsSync(t.path) && isDirty(t.path)) {
+      skipped.push([ui.style.yellow(path.basename(t.path)), "uncommitted changes"]);
+      continue;
+    }
+    candidates.push({ path: t.path, branch: t.branch });
+  }
+
+  ui.heading(apply ? "Removing merged worktrees" : "Merged worktrees (dry run)");
+  if (candidates.length === 0) ui.empty("nothing to remove");
+  else
+    ui.table(
+      candidates.map((c) => [ui.style.cyan(c.branch), ui.style.dim(c.path)]),
+    );
+  if (skipped.length > 0) {
+    ui.line();
+    ui.heading("Skipped");
+    ui.table(skipped);
+  }
+  if (!apply) {
+    if (candidates.length > 0) {
+      ui.line();
+      ui.info(`re-run with ${ui.style.cyan("--apply")} to remove ${candidates.length} worktree(s)`);
+    }
+    return;
+  }
+  let removed = 0;
+  for (const c of candidates) {
+    if (removeWorktree(main, c.path)) {
+      deleteBranch(main, c.branch);
+      ui.ok(`removed ${c.branch}`);
+      removed++;
+    } else ui.bad(`could not remove ${c.path}`);
+  }
+  ui.line();
+  ui.ok(`${removed} of ${candidates.length} removed`);
+}
+
+// ── cleanup ───────────────────────────────────────────────────────────────
+program
+  .command("cleanup")
+  .description("Remove indexes whose directory no longer exists (dry run by default)")
+  .option("--apply", "actually remove them", false)
+  .action(async (opts: { apply: boolean }) => {
+    const cfg = config();
+    requireProviders(cfg);
+    const { rows, unsupported } = await collectProjects(cfg);
+    const orphans = rows.filter((r) => !r.exists);
+
+    ui.heading(opts.apply ? "Removing orphaned indexes" : "Orphaned indexes (dry run)");
+    if (orphans.length === 0) {
+      ui.empty("nothing to clean up");
+      for (const n of unsupported) ui.info(`${n} cannot enumerate indexes`);
+      return;
+    }
+    ui.table(orphans.map((r) => [ui.style.cyan(r.provider), ui.style.red("gone"), r.path]));
+
+    if (!opts.apply) {
+      ui.line();
+      // Destructive and unrecoverable — a reindex is the only way back, so the
+      // default is always to show rather than do.
+      ui.info(`re-run with ${ui.style.cyan("--apply")} to remove ${orphans.length} index(es)`);
+      return;
+    }
+    const registry = registryFrom(cfg);
+    let removed = 0;
+    for (const orphan of orphans) {
+      const provider = registry.all().find((p) => p.name === orphan.provider);
+      if (!provider?.remove) {
+        ui.bad(`${orphan.provider} cannot remove indexes`, "configure `tools.remove`");
+        continue;
+      }
+      if (await provider.remove(orphan.path)) {
+        ui.ok(`removed ${orphan.path}`);
+        removed++;
+      } else {
+        ui.bad(`could not remove ${orphan.path}`);
+      }
+    }
+    ui.line();
+    ui.ok(`${removed} of ${orphans.length} removed`);
+  });
+
 // ── install-repo / uninstall-repo ──────────────────────────────────────────
 program
   .command("install-repo [repo]")

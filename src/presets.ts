@@ -40,6 +40,8 @@ export const PRESETS: Preset[] = [
         update: "codebase_update",
         index: "codebase_index",
         status: "codebase_status",
+        list: "codebase_list_projects",
+        remove: "codebase_remove",
       },
       repoArg: "projectPath",
       // A repo opts in by carrying this marker, which also pins a stable

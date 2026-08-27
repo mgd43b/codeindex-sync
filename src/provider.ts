@@ -65,6 +65,14 @@ export interface IndexProvider {
    * providers are configured. Cheap and synchronous-ish: no network.
    */
   detect(repoPath: string): Promise<boolean>;
+  /**
+   * Every project the backend holds an index for, or null when it cannot say.
+   * Optional: powers `list --all` and `cleanup`, both of which degrade to a
+   * clear "unsupported" message rather than guessing.
+   */
+  projects?(): Promise<string[] | null>;
+  /** Drop one index. Optional; `cleanup --apply` requires it. */
+  remove?(repoPath: string): Promise<boolean>;
 
   index(req: IndexRequest): Promise<IndexOutcome>;
 
