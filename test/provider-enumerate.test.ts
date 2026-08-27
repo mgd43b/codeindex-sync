@@ -9,7 +9,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { McpIndexProvider } from "../src/providers/mcp-provider.js";
+import { McpIndexProvider, parseProjectListing } from "../src/providers/mcp-provider.js";
 
 let dir: string;
 beforeEach(() => {
@@ -75,17 +75,21 @@ describe("projects()", () => {
       ),
       { list: "l" },
     );
-    expect(await p.projects()).toEqual(["/home/me/alpha", "/home/me/beta"]);
+    const got = await p.projects();
+    expect(got?.map((x) => x.path)).toEqual(["/home/me/alpha", "/home/me/beta"]);
+    // The detail lines beneath each path are captured, not discarded — this is
+    // what `list --all` renders as AGE / FILES / COLLECTION.
+    expect(got?.[0]).toMatchObject({ collection: "codebase_alpha", files: "39" });
   });
 
   it("keeps paths containing spaces", async () => {
     const p = providerFor(stub(TEXT("  - /home/me/my project")), { list: "l" });
-    expect(await p.projects()).toEqual(["/home/me/my project"]);
+    expect((await p.projects())?.map((x) => x.path)).toEqual(["/home/me/my project"]);
   });
 
   it("de-duplicates repeats", async () => {
     const p = providerFor(stub(TEXT("- /a\n- /a\n- /b")), { list: "l" });
-    expect(await p.projects()).toEqual(["/a", "/b"]);
+    expect((await p.projects())?.map((x) => x.path)).toEqual(["/a", "/b"]);
   });
 
   it("returns null when the backend has no list tool", async () => {
@@ -127,5 +131,64 @@ describe("remove()", () => {
       { remove: "r" },
     );
     expect(await p.remove("/a")).toBe(false);
+  });
+});
+
+describe("parseProjectListing", () => {
+  it("captures collection, file count and timestamp", () => {
+    const got = parseProjectListing(
+      [
+        "Indexed projects:",
+        "",
+        "  - /home/me/alpha",
+        "    Collection: codebase_alpha",
+        "    Last indexed: 2026-08-25T20:17:02.701Z",
+        "    Files: 39",
+      ].join("\n"),
+    );
+    expect(got).toEqual([
+      {
+        path: "/home/me/alpha",
+        collection: "codebase_alpha",
+        lastIndexedAt: "2026-08-25T20:17:02.701Z",
+        files: "39",
+      },
+    ]);
+  });
+
+  it("keeps a partial count verbatim and flags it incomplete", () => {
+    // "3437/2798" must not be coerced to a number: reporting 3437 would claim
+    // more files were indexed than actually were.
+    const got = parseProjectListing(
+      "  - /home/me/big\n    Files: 3437/2798 (INCOMPLETE — run codebase_index to resume)\n",
+    );
+    expect(got[0]?.files).toBe("3437/2798");
+    expect(got[0]?.incomplete).toBe(true);
+  });
+
+  it("ignores keys it does not know rather than failing", () => {
+    // A backend adding a field must not break parsing.
+    const got = parseProjectListing(
+      "  - /home/me/x\n    Code graph: 13 files, 6 edges\n    Something New: 1\n    Files: 4\n",
+    );
+    expect(got[0]).toEqual({ path: "/home/me/x", files: "4" });
+  });
+
+  it("attaches details to the right project when several are listed", () => {
+    const got = parseProjectListing(
+      "  - /a\n    Files: 1\n  - /b\n    Files: 2\n",
+    );
+    expect(got.map((g) => [g.path, g.files])).toEqual([
+      ["/a", "1"],
+      ["/b", "2"],
+    ]);
+  });
+
+  it("returns nothing for output with no paths", () => {
+    expect(parseProjectListing("No projects have been indexed.")).toEqual([]);
+  });
+
+  it("ignores detail lines that appear before any project", () => {
+    expect(parseProjectListing("  Files: 9\n  - /a\n")).toEqual([{ path: "/a" }]);
   });
 });

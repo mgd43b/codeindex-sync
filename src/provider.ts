@@ -54,6 +54,18 @@ export interface RepoStatus {
   lastIndexedAt?: string;
 }
 
+/** One index the backend holds, as it reports it. */
+export interface IndexedProject {
+  path: string;
+  /** Backend-native collection/index name, when it reports one. */
+  collection?: string;
+  /** Verbatim, so a partial index can say "3437/2798" rather than a wrong number. */
+  files?: string;
+  lastIndexedAt?: string;
+  /** A previous run was interrupted; only a full reindex clears it. */
+  incomplete?: boolean;
+}
+
 export interface IndexProvider {
   /** Stable id used in config and CLI output. */
   readonly name: string;
@@ -70,7 +82,7 @@ export interface IndexProvider {
    * Optional: powers `list --all` and `cleanup`, both of which degrade to a
    * clear "unsupported" message rather than guessing.
    */
-  projects?(): Promise<string[] | null>;
+  projects?(): Promise<IndexedProject[] | null>;
   /** Drop one index. Optional; `cleanup --apply` requires it. */
   remove?(repoPath: string): Promise<boolean>;
 

@@ -16,6 +16,7 @@ import type {
   IndexOutcome,
   IndexProvider,
   IndexRequest,
+  IndexedProject,
   ProviderHealth,
   RepoStatus,
 } from "../provider.js";
@@ -63,6 +64,52 @@ export interface McpProviderConfig {
  * report anything useful. Deleted directories are routine here: throwaway
  * worktrees, and `cleanup`, whose entire input is paths that no longer exist.
  */
+/**
+ * Parse a backend's project listing.
+ *
+ * Deliberately shape-driven rather than backend-specific: a line that is just a
+ * path starts a record, and the indented `Key: value` lines beneath it become
+ * its details. Backends that print more keys, or none, still work — unknown
+ * keys are ignored rather than causing a parse failure, so a backend adding a
+ * field never breaks this.
+ *
+ * Counts are kept verbatim. A partial index reports "3437/2798", and turning
+ * that into a number would silently claim more files than were indexed.
+ */
+export function parseProjectListing(text: string): IndexedProject[] {
+  const out: IndexedProject[] = [];
+  let current: IndexedProject | undefined;
+
+  for (const raw of text.split("\n")) {
+    const pathLine = /^\s*(?:[-*\u2022]\s*)?(\/.*\S)\s*$/.exec(raw);
+    if (pathLine?.[1]) {
+      current = { path: pathLine[1] };
+      out.push(current);
+      continue;
+    }
+    if (!current) continue;
+
+    const kv = /^\s+([A-Za-z][A-Za-z ]*?)\s*:\s*(.+?)\s*$/.exec(raw);
+    if (!kv) continue;
+    const key = kv[1]!.trim().toLowerCase();
+    const value = kv[2]!.trim();
+
+    if (key === "collection") current.collection = value;
+    else if (key === "files") {
+      // e.g. "39", or "3437/2798 (INCOMPLETE — run codebase_index to resume)"
+      const count = /^([\d,]+(?:\/[\d,]+)?)/.exec(value);
+      if (count?.[1]) current.files = count[1];
+      if (/incomplete/i.test(value)) current.incomplete = true;
+    } else if (key === "last indexed" || key === "indexed at" || key === "updated") {
+      current.lastIndexedAt = value;
+    }
+  }
+
+  // Deduplicate on path, keeping the first record for each.
+  const seen = new Set<string>();
+  return out.filter((p) => (seen.has(p.path) ? false : (seen.add(p.path), true)));
+}
+
 function safeCwd(wanted?: string): string {
   const candidates = [wanted, process.cwd(), homedir(), tmpdir()].filter(
     (c): c is string => typeof c === "string" && c.length > 0,
@@ -200,7 +247,7 @@ export class McpIndexProvider implements IndexProvider {
    * about any particular backend. A path containing a newline would be missed;
    * no filesystem in practice has one.
    */
-  async projects(): Promise<string[] | null> {
+  async projects(): Promise<IndexedProject[] | null> {
     const tool = this.cfg.tools.list;
     if (!tool) return null;
     try {
@@ -215,12 +262,7 @@ export class McpIndexProvider implements IndexProvider {
         (s) => s.callTool(tool, {}),
       );
       if (res.isError) return null;
-      const out: string[] = [];
-      for (const line of res.text.split("\n")) {
-        const m = /^\s*(?:[-*\u2022]\s*)?(\/.*\S)\s*$/.exec(line);
-        if (m?.[1]) out.push(m[1]);
-      }
-      return [...new Set(out)];
+      return parseProjectListing(res.text);
     } catch {
       return null;
     }

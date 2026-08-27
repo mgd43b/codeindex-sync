@@ -13,6 +13,7 @@
  */
 import { Command } from "commander";
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { ConfigError, configPath, loadConfig, saveConfig, type Config } from "./config.js";
 import {
@@ -304,7 +305,7 @@ program
   .option("--all", "every index the backend holds, not just this repo", false)
   .option("--stale", "with --all, only rows needing attention", false)
   .option("--json", "machine-readable output", false)
-  .option("--sort <key>", "with --all: path (default) or name", "path")
+  .option("--sort <key>", "with --all: recency (default), path or name", "recency")
   .action(async (repo: string | undefined, opts: ListOpts) => {
     const cfg = config();
     requireProviders(cfg);
@@ -655,65 +656,159 @@ interface ListOpts {
   sort: string;
 }
 
-/** One row of "what does the backend hold, and does it still exist on disk?" */
+/** A row of the `list --all` table: what the backend holds, plus live state. */
 interface ProjectRow {
   provider: string;
   path: string;
   exists: boolean;
+  collection?: string;
+  files?: string;
+  lastIndexedAt?: string;
+  incomplete?: boolean;
+  /** Live worker/queue state, which the backend cannot know about. */
+  state: "running" | "queued" | "gone" | "incomplete" | "ok";
+}
+
+/** "17m", "4h", "47h" — coarse on purpose; this is a freshness cue, not a clock. */
+function age(iso: string | undefined): string {
+  if (!iso) return "";
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) return "";
+  const mins = Math.max(0, Math.round((Date.now() - then) / 60000));
+  if (mins < 60) return `${mins}m`;
+  const hours = Math.round(mins / 60);
+  if (hours < 72) return `${hours}h`;
+  return `${Math.round(hours / 24)}d`;
 }
 
 /**
- * Every index across every provider, paired with whether its directory is
- * still there. Shared by `list --all` and `cleanup`, so the two can never
- * disagree about what is orphaned.
+ * Shorten a path for display: $HOME becomes ~, and anything still too long
+ * keeps its tail, which is the part that identifies the repo.
  */
-async function collectProjects(cfg: Config): Promise<{ rows: ProjectRow[]; unsupported: string[] }> {
+function shortPath(p: string, max = 56): string {
+  const home = homedir();
+  let out = p.startsWith(home) ? `~${p.slice(home.length)}` : p;
+  if (out.length > max) out = `\u2026${out.slice(out.length - max + 1)}`;
+  return out;
+}
+
+/**
+ * Every index across every provider, joined with what this machine knows.
+ *
+ * The backend can say when a repo was last indexed; only the queue and the
+ * processing directory know that one is running or waiting right now, and only
+ * the filesystem knows the directory is gone. Merging them here is what makes
+ * one table answer "is anything wrong".
+ */
+async function collectProjects(
+  cfg: Config,
+): Promise<{ rows: ProjectRow[]; unsupported: string[] }> {
+  const paths = resolvePaths();
+  const queued = new Set(new Queue(paths.queue).list().map((j) => path.resolve(j.repoPath)));
+  const running = new Set(
+    new Queue(paths.processing).list().map((j) => path.resolve(j.repoPath)),
+  );
+
   const rows: ProjectRow[] = [];
   const unsupported: string[] = [];
   for (const provider of registryFrom(cfg).all()) {
-    const paths = provider.projects ? await provider.projects() : null;
-    if (paths === null) {
+    const projects = provider.projects ? await provider.projects() : null;
+    if (projects === null) {
       unsupported.push(provider.name);
       continue;
     }
-    for (const p of paths) rows.push({ provider: provider.name, path: p, exists: existsSync(p) });
+    for (const proj of projects) {
+      const exists = existsSync(proj.path);
+      const resolved = path.resolve(proj.path);
+      const state: ProjectRow["state"] = running.has(resolved)
+        ? "running"
+        : queued.has(resolved)
+          ? "queued"
+          : !exists
+            ? "gone"
+            : proj.incomplete
+              ? "incomplete"
+              : "ok";
+      rows.push({
+        provider: provider.name,
+        path: proj.path,
+        exists,
+        state,
+        ...(proj.collection === undefined ? {} : { collection: proj.collection }),
+        ...(proj.files === undefined ? {} : { files: proj.files }),
+        ...(proj.lastIndexedAt === undefined ? {} : { lastIndexedAt: proj.lastIndexedAt }),
+        ...(proj.incomplete === undefined ? {} : { incomplete: proj.incomplete }),
+      });
+    }
   }
   return { rows, unsupported };
 }
 
+const STATE_STYLE: Record<ProjectRow["state"], (s: string) => string> = {
+  running: ui.style.cyan,
+  queued: ui.style.dim,
+  gone: ui.style.red,
+  incomplete: ui.style.yellow,
+  ok: ui.style.green,
+};
+
 async function listAll(cfg: Config, opts: ListOpts): Promise<void> {
   const { rows, unsupported } = await collectProjects(cfg);
-  const shown = (opts.stale ? rows.filter((r) => !r.exists) : rows).sort((a, b) =>
-    opts.sort === "name"
-      ? path.basename(a.path).localeCompare(path.basename(b.path))
-      : a.path.localeCompare(b.path),
-  );
+  const interesting = (r: ProjectRow): boolean => r.state !== "ok";
+  const shown = (opts.stale ? rows.filter(interesting) : rows).sort((a, b) => {
+    if (opts.sort === "name") {
+      return path.basename(a.path).localeCompare(path.basename(b.path));
+    }
+    if (opts.sort === "path") return a.path.localeCompare(b.path);
+    // Default: most recently indexed first, which puts active work on top.
+    const at = Date.parse(a.lastIndexedAt ?? "") || 0;
+    const bt = Date.parse(b.lastIndexedAt ?? "") || 0;
+    return bt - at;
+  });
 
   if (opts.json) {
     process.stdout.write(JSON.stringify({ projects: shown, unsupported }, null, 2) + "\n");
     return;
   }
+
   ui.heading(opts.stale ? "Indexes needing attention" : "All indexes");
   if (shown.length === 0) {
-    ui.empty(opts.stale ? "nothing stale" : "no indexes reported");
+    ui.empty(opts.stale ? "nothing needs attention" : "no indexes reported");
   } else {
+    const header = ["STATUS", "AGE", "FILES", "PROJECT", "COLLECTION"].map((h) =>
+      ui.style.dim(h),
+    );
     ui.table(
-      shown.map((r) => [
-        ui.style.cyan(r.provider),
-        r.exists ? ui.style.green("on disk") : ui.style.red("gone"),
-        r.path,
-      ]),
+      [
+        header,
+        ...shown.map((r) => [
+          STATE_STYLE[r.state](r.state),
+          age(r.lastIndexedAt),
+          r.files ?? "",
+          shortPath(r.path),
+          ui.style.dim(r.collection ?? ""),
+        ]),
+      ],
+      { right: [1, 2] },
     );
   }
   for (const name of unsupported) {
     ui.info(`${name} cannot enumerate indexes (no \`tools.list\` configured)`);
   }
-  const gone = rows.filter((r) => !r.exists).length;
-  if (gone > 0 && !opts.stale) {
-    ui.line();
+
+  const gone = rows.filter((r) => r.state === "gone").length;
+  const incomplete = rows.filter((r) => r.state === "incomplete").length;
+  if (!opts.stale && (gone || incomplete)) ui.line();
+  if (!opts.stale && gone > 0) {
     ui.warn(
       `${gone} index(es) point at directories that no longer exist`,
       `review with ${ui.style.cyan("codeindex-sync cleanup")}`,
+    );
+  }
+  if (!opts.stale && incomplete > 0) {
+    ui.warn(
+      `${incomplete} index(es) are incomplete — a previous run was interrupted`,
+      `only a full reindex clears this: ${ui.style.cyan("codeindex-sync sync <repo> --full")}`,
     );
   }
 }

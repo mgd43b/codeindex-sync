@@ -71,9 +71,15 @@ export function empty(what: string, next?: string): void {
 }
 
 /** Left-aligned columns, sized to content. Nothing is truncated silently. */
-export function table(rows: string[][], opts: { indent?: string } = {}): void {
+export function table(
+  rows: string[][],
+  opts: { indent?: string; right?: number[] } = {},
+): void {
   if (rows.length === 0) return;
   const indent = opts.indent ?? "  ";
+  // Counts are read by comparing them, which only works when the digits line
+  // up, so numeric columns are right-aligned.
+  const right = new Set(opts.right ?? []);
   const widths: number[] = [];
   for (const row of rows) {
     row.forEach((cell, i) => {
@@ -81,9 +87,12 @@ export function table(rows: string[][], opts: { indent?: string } = {}): void {
     });
   }
   for (const row of rows) {
-    const padded = row.map((cell, i) =>
-      i === row.length - 1 ? cell : cell + " ".repeat((widths[i] ?? 0) - stripAnsi(cell).length),
-    );
+    const padded = row.map((cell, i) => {
+      const pad = " ".repeat((widths[i] ?? 0) - stripAnsi(cell).length);
+      if (right.has(i)) return pad + cell;
+      // The last column needs no trailing padding.
+      return i === row.length - 1 ? cell : cell + pad;
+    });
     line(indent + padded.join("  "));
   }
 }

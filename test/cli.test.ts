@@ -10,6 +10,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { Queue } from "../src/queue.js";
 
 const CLI = path.resolve("dist/cli.js");
 let home: string;
@@ -225,6 +226,64 @@ describe("completion", () => {
     const r = cli(["completion", "tcsh"]);
     expect(r.code).toBe(1);
     expect(r.out).toMatch(/bash, zsh, fish/);
+  });
+});
+
+describe("list --all", () => {
+  /** A stub backend that reports one project, so listing has something to show. */
+  function backendListing(repoPath: string): string {
+    const file = path.join(home, "listing-server.mjs");
+    const text = `Indexed projects:\n\n  - ${repoPath}\n    Collection: codebase_x\n    Files: 7\n    Last indexed: 2020-01-01T00:00:00.000Z\n`;
+    writeFileSync(
+      file,
+      `let buf="";process.stdin.on("data",c=>{buf+=c;let n;while((n=buf.indexOf("\\n"))!==-1){const l=buf.slice(0,n).trim();buf=buf.slice(n+1);if(!l)continue;const m=JSON.parse(l);
+       if(m.method==="initialize")process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{}})+"\\n");
+       if(m.method==="tools/call")process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{content:[{type:"text",text:${JSON.stringify(text)}}]}})+"\\n");}});`,
+      "utf8",
+    );
+    writeConfig({
+      providers: [
+        { name: "stub", command: process.execPath, args: [file], tools: { update: "u", list: "l" } },
+      ],
+    });
+    return file;
+  }
+
+  it("reports a project the worker is currently processing as running", () => {
+    // Only this machine knows a job is in flight; the backend cannot say so.
+    // Planted directly rather than raced against a real index, which finishes
+    // too fast to observe reliably.
+    const repo = mkdtempSync(path.join(tmpdir(), "codeindex-running-"));
+    backendListing(repo);
+    // Written through Queue rather than by hand, so the test cannot drift from
+    // the on-disk format.
+    new Queue(path.join(state, "processing")).enqueue({ repoPath: repo, hook: "post-commit" });
+    const out = cli(["list", "--all", "--json"]).out;
+    const parsed = JSON.parse(out) as { projects: { path: string; state: string }[] };
+    expect(parsed.projects[0]?.state).toBe("running");
+    rmSync(repo, { recursive: true, force: true });
+  });
+
+  it("reports a project whose directory is gone", () => {
+    const repo = path.join(tmpdir(), "codeindex-definitely-absent-xyz");
+    backendListing(repo);
+    const parsed = JSON.parse(cli(["list", "--all", "--json"]).out) as {
+      projects: { state: string; collection?: string; files?: string }[];
+    };
+    expect(parsed.projects[0]?.state).toBe("gone");
+    // The backend's own details still come through for a missing directory.
+    expect(parsed.projects[0]?.collection).toBe("codebase_x");
+    expect(parsed.projects[0]?.files).toBe("7");
+  });
+
+  it("names providers that cannot enumerate, rather than reporting nothing", () => {
+    writeConfig({ providers: [{ name: "nolist", command: "x", tools: { update: "u" } }] });
+    const parsed = JSON.parse(cli(["list", "--all", "--json"]).out) as {
+      projects: unknown[];
+      unsupported: string[];
+    };
+    expect(parsed.projects).toEqual([]);
+    expect(parsed.unsupported).toEqual(["nolist"]);
   });
 });
 
