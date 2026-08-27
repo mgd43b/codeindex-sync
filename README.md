@@ -11,7 +11,7 @@ was built against and ships as a built-in preset, so that setup is four
 commands:
 
 ```bash
-npm install -g codeindex-sync
+npm install -g codeindex-sync   # or: brew install mgd43b/taps/codeindex-sync
 codeindex-sync init --preset socraticode   # configure a backend
 codeindex-sync install                     # install the git hooks
 codeindex-sync schedule                    # drain the queue on a timer
@@ -117,6 +117,12 @@ in the worker, the abstraction has leaked.
 - **`busy` is not failure.** Contention requeues without burning an attempt.
 - **The log is the diagnostic.** Append-only, rotated not truncated, and writing
   to it never throws.
+
+## Releasing
+
+See [docs/releasing.md](docs/releasing.md). Publishing to npm requires
+credentials and is a manual step; the Homebrew formula is generated from the
+published tarball by `scripts/update-tap.sh`.
 
 ## Requirements
 
