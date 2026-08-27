@@ -27,3 +27,7 @@ export type { Config } from "./config.js";
 export { PRESETS, findPreset } from "./presets.js";
 export type { Preset } from "./presets.js";
 export { withMcp, McpSession, McpError } from "./mcp.js";
+export { createIndexHandler } from "./handlers/index-handler.js";
+export type { IndexHandlerOptions } from "./handlers/index-handler.js";
+export { buildHookRegistry, buildProviderRegistry } from "./runtime.js";
+export { defaultHooksDir, dispatcherScript, installDispatcher, isOurHooksDir } from "./install.js";

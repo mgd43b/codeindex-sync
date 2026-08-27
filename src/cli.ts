@@ -24,7 +24,7 @@ import {
   setGlobalHooksPath,
   unsetGlobalHooksPath,
 } from "./git.js";
-import { HookRegistry, isGitHook, type GitHook } from "./hooks.js";
+import { isGitHook, type GitHook } from "./hooks.js";
 import { defaultHooksDir, installDispatcher, isOurHooksDir } from "./install.js";
 import { WorkerLock } from "./lock.js";
 import { Logger } from "./logger.js";
@@ -34,6 +34,7 @@ import { ProviderRegistry } from "./provider.js";
 import { McpIndexProvider } from "./providers/mcp-provider.js";
 import { Queue, nowIso } from "./queue.js";
 import * as ui from "./ui.js";
+import { buildHookRegistry } from "./runtime.js";
 import { Worker } from "./worker.js";
 
 const VERSION = "0.1.0";
@@ -383,13 +384,11 @@ program
   .description("List registered git-hook handlers")
   .action(() => {
     // Indexing is only the first subscriber; third-party handlers register here.
-    const all = new HookRegistry().all();
+    const all = buildHookRegistry(config()).all();
     ui.heading("Hook handlers");
-    if (all.length === 0) {
-      ui.empty("only the built-in indexer is active", "see docs/extending.md to add one");
-    } else {
-      ui.table(all.map((h) => [ui.style.cyan(h.name), h.hooks.join(", "), h.description]));
-    }
+    ui.table(all.map((h) => [ui.style.cyan(h.name), h.hooks.join(", "), h.description]));
+    ui.line();
+    ui.line(`  ${ui.style.dim("add one:")} see docs/extending.md`);
   });
 
 // ── worktrees ─────────────────────────────────────────────────────────────
@@ -485,7 +484,7 @@ program
 program
   .command("hook <name> [args...]")
   .description("Entry point for git hooks (enqueues only; never indexes inline)")
-  .action((name: string, args: string[]) => {
+  .action(async (name: string, args: string[]) => {
     // Unknown hooks are ignored rather than erroring: this runs inside the
     // user's git commands and must never break them.
     if (!isGitHook(name)) return;
@@ -493,14 +492,16 @@ program
     // Resolve to the MAIN worktree, so a linked worktree does not create a
     // second index and a deleted worktree cwd is never used.
     const root = mainWorktree(process.cwd()) ?? repoRoot(process.cwd());
-    if (!root || !root.startsWith(cfg.root)) return;
-    new Queue(resolvePaths().queue).enqueue({
-      repoPath: root,
+    if (!root) return;
+    // Dispatch through the registry rather than enqueuing directly: the
+    // built-in indexer is just another subscriber, so third-party handlers
+    // receive the same event on the same terms.
+    await buildHookRegistry(cfg).dispatch({
       hook: name as GitHook,
-      full: false,
-      enqueuedAt: nowIso(),
+      repoPath: root,
+      args,
+      at: nowIso(),
     });
-    void args;
   });
 
 program.parseAsync(process.argv).catch((err: unknown) => {
