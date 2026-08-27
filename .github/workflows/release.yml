@@ -1,0 +1,66 @@
+name: release
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: Pack and validate without publishing
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  # Required for npm provenance: npm verifies the package was built by this
+  # workflow, from this commit, so consumers can trace a tarball to its source.
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+
+      # The published tarball is what users get, so assert its contents rather
+      # than trusting `files`. A missing dist/ or an accidentally shipped
+      # node_modules only shows up here.
+      - name: Verify package contents
+        run: |
+          npm pack --dry-run --json > /tmp/pack.json
+          node -e '
+            const p = require("/tmp/pack.json")[0];
+            const names = p.files.map(f => f.path);
+            const need = ["dist/cli.js", "dist/index.js", "README.md", "LICENSE"];
+            const missing = need.filter(n => !names.includes(n));
+            if (missing.length) { console.error("missing from tarball:", missing); process.exit(1); }
+            const junk = names.filter(n => n.startsWith("node_modules/") || n.startsWith("test/") || n.endsWith(".test.ts"));
+            if (junk.length) { console.error("should not ship:", junk.slice(0, 10)); process.exit(1); }
+            console.log(`ok: ${names.length} files, ${(p.size/1024).toFixed(1)} KB packed`);
+          '
+
+      # The installed binary must actually run. A broken shebang or a bad
+      # `bin` path passes every other check and fails on the user's machine.
+      - name: Smoke-test the packed binary
+        run: |
+          npm pack --silent
+          tarball=$(ls codeindex-sync-*.tgz)
+          mkdir /tmp/smoke && cd /tmp/smoke && npm init -y >/dev/null
+          npm install "$GITHUB_WORKSPACE/$tarball" --silent
+          ./node_modules/.bin/codeindex-sync --version
+          ./node_modules/.bin/codeindex-sync providers --example | node -e 'JSON.parse(require("fs").readFileSync(0));console.log("example config parses")'
+
+      - name: Publish
+        if: github.event_name == 'release'
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

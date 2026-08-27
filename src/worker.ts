@@ -115,7 +115,7 @@ export class Worker {
   /** Return interrupted jobs to the queue. Run before draining. */
   recoverOrphans(): number {
     let recovered = 0;
-    let names: string[] = [];
+    let names: string[];
     try {
       names = readdirSync(this.opts.paths.processing);
     } catch {
@@ -266,7 +266,7 @@ export class Worker {
 
   listFailed(): Job[] {
     const dir = this.opts.paths.failed;
-    let names: string[] = [];
+    let names: string[];
     try {
       names = readdirSync(dir);
     } catch {

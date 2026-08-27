@@ -29,6 +29,13 @@ export function defaultHooksDir(): string {
  * Deliberately does NOT index inline — it enqueues and returns, so a git
  * command never waits on a backend.
  */
+// The \$ escapes below are unnecessary *today*, only because no sigil here
+// happens to be followed by "{". Dropping them would make this template
+// silently fragile: the first person to write a braced shell variable would get
+// JS interpolation and a corrupted hook, with no error anywhere. Escaping every
+// sigil keeps the rule "shell $ is always escaped" rather than the far more
+// error-prone "escape only when it currently matters".
+/* eslint-disable no-useless-escape */
 export function dispatcherScript(binary = "codeindex-sync"): string {
   return `#!/bin/sh
 ${MARKER}
