@@ -15,8 +15,17 @@ import { Command } from "commander";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { ConfigError, configPath, loadConfig, saveConfig, type Config } from "./config.js";
-import { globalHooksPath, listWorktrees, mainWorktree, pruneWorktrees, repoRoot } from "./git.js";
+import {
+  globalHooksPath,
+  listWorktrees,
+  mainWorktree,
+  pruneWorktrees,
+  repoRoot,
+  setGlobalHooksPath,
+  unsetGlobalHooksPath,
+} from "./git.js";
 import { HookRegistry, isGitHook, type GitHook } from "./hooks.js";
+import { defaultHooksDir, installDispatcher, isOurHooksDir } from "./install.js";
 import { WorkerLock } from "./lock.js";
 import { Logger } from "./logger.js";
 import { resolvePaths } from "./paths.js";
@@ -414,6 +423,62 @@ program
         "these hand the indexer a deleted directory: codeindex-sync worktrees --prune",
       );
     }
+  });
+
+// ── install / uninstall ───────────────────────────────────────────────────
+program
+  .command("install")
+  .description("Install the git hook dispatcher globally")
+  .option("--hooks-dir <dir>", "where to install", defaultHooksDir())
+  .option("--yes", "skip the confirmation prompt", false)
+  .action((opts: { hooksDir: string; yes: boolean }) => {
+    const existing = globalHooksPath();
+    // core.hooksPath is global and exclusive: it REPLACES each repo's own
+    // .git/hooks. Taking it over from another tool without warning would
+    // silently disable that tool everywhere.
+    if (existing && path.resolve(existing) !== path.resolve(opts.hooksDir) && !isOurHooksDir(existing)) {
+      ui.heading("Another tool owns your global git hooks");
+      ui.warn(`core.hooksPath is currently ${existing}`);
+      ui.line();
+      ui.line("  codeindex-sync would take it over. Its dispatcher chains each repo's");
+      ui.line("  own .git/hooks, but it does NOT chain another global hooksPath.");
+      ui.line();
+      ui.line(`  ${ui.style.dim("to proceed anyway:")} ${ui.style.cyan("codeindex-sync install --yes")}`);
+      if (!opts.yes) {
+        process.exitCode = 1;
+        return;
+      }
+    }
+
+    const res = installDispatcher(opts.hooksDir);
+    ui.heading("Installed git hooks");
+    ui.ok(`dispatcher in ${res.hooksDir}`);
+    ui.table(res.installed.map((h) => [ui.style.cyan(h)]));
+    setGlobalHooksPath(res.hooksDir);
+    ui.ok(`core.hooksPath = ${res.hooksDir}`);
+    ui.line();
+    ui.info("each repo's own .git/hooks are chained, so existing tooling keeps working");
+    ui.line(`  ${ui.style.dim("next:")} ${ui.style.cyan("codeindex-sync doctor")}`);
+  });
+
+program
+  .command("uninstall")
+  .description("Remove the global git hooks setting")
+  .action(() => {
+    const existing = globalHooksPath();
+    if (!existing) {
+      ui.empty("core.hooksPath is not set; nothing to undo");
+      return;
+    }
+    if (!isOurHooksDir(existing)) {
+      ui.fail(
+        `core.hooksPath points at ${existing}, which was not installed by codeindex-sync`,
+        "leaving it alone — unset it yourself with `git config --global --unset core.hooksPath`",
+      );
+    }
+    unsetGlobalHooksPath();
+    ui.ok("unset core.hooksPath");
+    ui.info(`hook scripts left in ${existing} — delete them if you want them gone`);
   });
 
 // ── hook entry point ──────────────────────────────────────────────────────

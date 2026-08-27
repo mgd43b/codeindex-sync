@@ -107,3 +107,12 @@ export function currentBranch(dir: string): string | null {
 export function globalHooksPath(): string | null {
   return git(["config", "--global", "core.hooksPath"]);
 }
+
+/** Set the global core.hooksPath. Machine-wide: callers must confirm first. */
+export function setGlobalHooksPath(dir: string): void {
+  git(["config", "--global", "core.hooksPath", dir]);
+}
+
+export function unsetGlobalHooksPath(): void {
+  git(["config", "--global", "--unset", "core.hooksPath"]);
+}
