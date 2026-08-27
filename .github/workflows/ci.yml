@@ -15,5 +15,8 @@ jobs:
         with: { node-version: '${{ matrix.node }}', cache: npm }
       - run: npm ci
       - run: npm run typecheck
-      - run: npm test
+      # Build BEFORE test: the CLI smoke tests exercise dist/cli.js as a
+      # subprocess, which is the only way to assert exit codes and the text a
+      # human actually reads on failure.
       - run: npm run build
+      - run: npm test

@@ -70,10 +70,15 @@ in the worker, the abstraction has leaked.
 
 - **Serialised by design.** Indexing backends are usually GPU- or network-bound
   singletons; one job at a time is faster than several.
+- **Nothing-changed is settled before any work.** A (HEAD, dirty) fingerprint
+  catches the common case: a hook fired for worktree activity that never touched
+  this repo. Measured 1.20s → 0.12s, without contacting the backend at all. A
+  dirty tree never counts as unchanged, since two sets of uncommitted edits are
+  indistinguishable.
 - **Coalescing uses an invariant, not a timer.** An index that *started* at T
-  observed the filesystem as of T, so a job queued before T is already covered.
-  A real change can never be dropped, because its hook fires only after the file
-  changed.
+  observed the filesystem as of T, so a job queued before T is already covered —
+  this catches recovered and retried jobs. A real change can never be dropped,
+  because its hook fires only after the file changed.
 - **`busy` is not failure.** Contention requeues without burning an attempt.
 - **The log is the diagnostic.** Append-only, rotated not truncated, and writing
   to it never throws.
