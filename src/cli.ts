@@ -39,7 +39,7 @@ import {
 } from "./install.js";
 import { WorkerLock } from "./lock.js";
 import { Logger } from "./logger.js";
-import { isUnder, resolvePaths } from "./paths.js";
+import { resolvePaths } from "./paths.js";
 import { PRESETS, findPreset } from "./presets.js";
 import {
   DEFAULT_INTERVAL,
@@ -788,6 +788,11 @@ function pruneGoneWorktrees(repo: string, apply: boolean): void {
  * exists. A list that drifts out of date is worse than none: it teaches the
  * wrong names.
  */
+// The \$ escapes below mirror install.ts: shell sigils are escaped uniformly so
+// the rule stays "shell $ is always escaped" rather than the error-prone "escape
+// only where it currently matters". The first braced shell variable added here
+// would otherwise become JS interpolation and silently corrupt the script.
+/* eslint-disable no-useless-escape */
 function completionScript(shell: string, commands: string[]): string {
   const words = commands.join(" ");
   if (shell === "bash") {
@@ -824,6 +829,8 @@ ${commands
   .join("\n")}
 `;
 }
+
+/* eslint-enable no-useless-escape */
 
 program
   .command("completion [shell]")
