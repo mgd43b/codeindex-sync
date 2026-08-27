@@ -40,9 +40,13 @@ export function defaultHooksDir(): string {
 export function dispatcherScript(binary = "codeindex-sync", enqueue = true): string {
   const enqueueBlock = enqueue
     ? `
-# 2. Enqueue. Never blocks: the worker does the actual indexing.
+# 2. Enqueue, then kick a worker. Neither blocks: the drain is fully detached,
+# so git returns immediately, and indexing starts now rather than waiting for
+# the next scheduled tick. Concurrent drains are safe — the worker takes a lock
+# and any second one exits at once — so a burst of hooks still indexes once.
 if command -v ${binary} >/dev/null 2>&1; then
   ${binary} hook "\$hook_name" "\$@" >/dev/null 2>&1 || true
+  ( nohup ${binary} drain >/dev/null 2>&1 & ) </dev/null >/dev/null 2>&1 || true
 fi`
     : `
 # This hook type is not an indexing trigger. The dispatcher exists purely so the
@@ -145,6 +149,7 @@ export function repoDispatcherScript(binary: string, chainDir: string, enqueue =
     ? `
 if command -v ${binary} >/dev/null 2>&1; then
   ${binary} hook "\$hook_name" "\$@" >/dev/null 2>&1 || true
+  ( nohup ${binary} drain >/dev/null 2>&1 & ) </dev/null >/dev/null 2>&1 || true
 fi`
     : `
 # Not an indexing trigger; this exists only so the repo's own hook still runs.`;

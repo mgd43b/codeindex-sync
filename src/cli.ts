@@ -209,13 +209,13 @@ program
     } else if (scheduleInstalled()) {
       ui.ok("a timer is draining the queue");
     } else {
-      // Everything else can look perfect while nothing is ever indexed, because
-      // hooks only enqueue. This is the most common "it silently does nothing".
-      ui.warn(
-        "nothing drains the queue — hooks enqueue but never index inline",
-        `run ${ui.style.cyan("codeindex-sync schedule")}`,
+      // Not a problem: the hook dispatcher fires a detached drain, so commits
+      // index immediately without a timer. A timer is a safety net — it picks
+      // up jobs left behind when a drain is killed mid-run, and retries — so
+      // this is a recommendation, not a fault.
+      ui.info(
+        `no timer — commits still index immediately; ${ui.style.cyan("codeindex-sync schedule")} adds a safety net`,
       );
-      problems++;
     }
 
     ui.heading("Backends");
