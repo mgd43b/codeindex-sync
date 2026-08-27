@@ -10,6 +10,7 @@
  * "I don't know" rather than crash the worker.
  */
 import { execFileSync } from "node:child_process";
+import path from "node:path";
 
 function git(args: string[], cwd?: string): string | null {
   try {
@@ -120,4 +121,33 @@ export function setGlobalHooksPath(dir: string): void {
 
 export function unsetGlobalHooksPath(): void {
   git(["config", "--global", "--unset", "core.hooksPath"]);
+}
+
+/**
+ * The `core.hooksPath` set on this repository specifically, if any.
+ *
+ * Local config beats global, so a repo that sets this (husky, lefthook, a
+ * `.githooks` convention) silently opts out of the global dispatcher. Detecting
+ * it is the difference between "covered" and "looks covered".
+ */
+export function localHooksPath(repo: string): string | null {
+  return git(["config", "--local", "core.hooksPath"], repo);
+}
+
+/** What git will *actually* use for this repo, after config precedence. */
+export function effectiveHooksPath(repo: string): string | null {
+  return git(["config", "core.hooksPath"], repo);
+}
+
+export function setLocalHooksPath(repo: string, dir: string): void {
+  git(["config", "--local", "core.hooksPath", dir], repo);
+}
+
+export function unsetLocalHooksPath(repo: string): void {
+  git(["config", "--local", "--unset", "core.hooksPath"], repo);
+}
+
+/** The directory git resolves `core.hooksPath` against, honouring relative paths. */
+export function resolveHooksPath(repo: string, value: string): string {
+  return path.isAbsolute(value) ? value : path.join(repo, value);
 }

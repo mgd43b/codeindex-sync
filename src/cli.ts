@@ -25,7 +25,14 @@ import {
   unsetGlobalHooksPath,
 } from "./git.js";
 import { isGitHook, type GitHook } from "./hooks.js";
-import { defaultHooksDir, installDispatcher, isOurHooksDir } from "./install.js";
+import {
+  defaultHooksDir,
+  installDispatcher,
+  installRepoDispatcher,
+  isOurHooksDir,
+  repoCoverage,
+  uninstallRepoDispatcher,
+} from "./install.js";
 import { WorkerLock } from "./lock.js";
 import { Logger } from "./logger.js";
 import { resolvePaths } from "./paths.js";
@@ -165,6 +172,23 @@ program
         "point it at a hooks directory that calls `codeindex-sync hook <name>`",
       );
       problems++;
+    }
+
+    // A global hooksPath says nothing about THIS repo: local config wins, so a
+    // repo with its own hooksPath is bypassed entirely while the global check
+    // still reads green. Report what git will actually use.
+    const here = repoRoot(process.cwd());
+    if (here) {
+      const cov = repoCoverage(here, hooks);
+      const name = path.basename(here);
+      if (cov.covered) ui.ok(`${name} — covered by the ${cov.reason}`);
+      else {
+        ui.bad(
+          `${name} — not covered: ${cov.reason}`,
+          `run ${ui.style.cyan(`codeindex-sync install-repo ${here}`)}`,
+        );
+        problems++;
+      }
     }
 
     ui.heading("Backends");
@@ -543,6 +567,41 @@ program
   });
 
 // ── hook entry point ──────────────────────────────────────────────────────
+// ── install-repo / uninstall-repo ──────────────────────────────────────────
+program
+  .command("install-repo [repo]")
+  .description("Cover a repo that sets its own core.hooksPath (husky, .githooks)")
+  .action((repo: string | undefined) => {
+    const target = resolveRepo(repo ?? process.cwd());
+    const paths = resolvePaths();
+    const res = installRepoDispatcher(target, paths.repoHooks);
+
+    ui.heading(`Covered ${path.basename(target)}`);
+    ui.ok(`dispatcher in ${res.hooksDir}`);
+    ui.ok(`core.hooksPath (local) = ${res.hooksDir}`);
+    if (res.chained) ui.info(`chaining its previous hooks in ${res.chained}`);
+    else ui.info("no previous hooksPath — .git/hooks is chained");
+    if (res.alreadyOurs) ui.info("already covered; dispatcher refreshed");
+    ui.line();
+    ui.line(`  ${ui.style.dim("•")} nothing was written inside the repository`);
+    ui.line(`  ${ui.style.dim("undo:")} ${ui.style.cyan(`codeindex-sync uninstall-repo ${target}`)}`);
+  });
+
+program
+  .command("uninstall-repo [repo]")
+  .description("Undo install-repo, restoring the repo's own core.hooksPath")
+  .action((repo: string | undefined) => {
+    const target = resolveRepo(repo ?? process.cwd());
+    const paths = resolvePaths();
+    const res = uninstallRepoDispatcher(target, paths.repoHooks);
+    if (!res.wasOurs) {
+      ui.info(`${path.basename(target)} is not covered by a repo-scoped dispatcher`);
+      return;
+    }
+    if (res.restored) ui.ok(`restored core.hooksPath = ${res.restored}`);
+    else ui.ok("cleared core.hooksPath (the global dispatcher applies again)");
+  });
+
 program
   .command("hook <name> [args...]")
   .description("Entry point for git hooks (enqueues only; never indexes inline)")

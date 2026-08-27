@@ -12,10 +12,11 @@
  * git command, so its job is to be near-free: work out the repo, hand off, and
  * get out of the way. Anything expensive belongs in the queue.
  */
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { GIT_HOOKS } from "./hooks.js";
+import { localHooksPath, resolveHooksPath, setLocalHooksPath, unsetLocalHooksPath } from "./git.js";
 
 export const MARKER = "# codeindex-sync dispatcher";
 
@@ -109,4 +110,137 @@ export function isOurHooksDir(dir: string): boolean {
     }
   }
   return false;
+}
+
+
+// ── Repository-scoped install ───────────────────────────────────────────────
+//
+// A repo that sets its own `core.hooksPath` (husky, lefthook, a `.githooks`
+// convention) overrides the global one, so the global dispatcher never runs
+// there. Such a repo cannot be covered globally — it has to be covered on its
+// own terms: take over its `core.hooksPath`, and chain whatever it pointed at.
+//
+// Nothing is ever written inside the repository. The dispatcher lives in state,
+// so the working tree stays clean and no one has to gitignore our files.
+
+/** Stable, reversible directory name for a repo's dispatcher. */
+export function repoSlug(repo: string): string {
+  return path.resolve(repo).replace(/[^A-Za-z0-9]/g, "_");
+}
+
+/** Where the previous hooksPath is remembered, so uninstall can restore it. */
+const ORIGINAL = ".original-hooks-path";
+
+/* eslint-disable no-useless-escape */
+export function repoDispatcherScript(binary: string, chainDir: string): string {
+  return `#!/bin/sh
+${MARKER} (repo-scoped)
+# Installed by \`codeindex-sync install-repo\`. This repository sets its own
+# core.hooksPath, which overrides the global one, so it is covered here instead.
+# The directory it used before is chained below — nothing it had stops working.
+hook_name=\$(basename "\$0")
+repo_root=\$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
+chained="${chainDir}"
+if [ -n "\$chained" ]; then
+  case "\$chained" in
+    /*) chain_dir="\$chained" ;;
+    *)  chain_dir="\$repo_root/\$chained" ;;
+  esac
+  if [ -x "\$chain_dir/\$hook_name" ]; then
+    "\$chain_dir/\$hook_name" "\$@" || exit \$?
+  fi
+fi
+
+if command -v ${binary} >/dev/null 2>&1; then
+  ${binary} hook "\$hook_name" "\$@" >/dev/null 2>&1 || true
+fi
+exit 0
+`;
+}
+/* eslint-enable no-useless-escape */
+
+export interface RepoInstallResult {
+  hooksDir: string;
+  /** What this repo's core.hooksPath pointed at before, if anything. */
+  chained: string | null;
+  alreadyOurs: boolean;
+}
+
+export function installRepoDispatcher(
+  repo: string,
+  repoHooksRoot: string,
+  binary = "codeindex-sync",
+): RepoInstallResult {
+  const current = localHooksPath(repo);
+  const dir = path.join(repoHooksRoot, repoSlug(repo));
+
+  // Re-running must not chain our own dispatcher to itself, which would
+  // recurse until the shell gives up.
+  const alreadyOurs = current !== null && path.resolve(current) === path.resolve(dir);
+  let chained: string | null;
+  if (alreadyOurs) {
+    const saved = path.join(dir, ORIGINAL);
+    chained = existsSync(saved) ? readFileSync(saved, "utf8").trim() || null : null;
+  } else {
+    chained = current;
+  }
+
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, ORIGINAL), chained ?? "", "utf8");
+
+  // With no previous hooksPath, the repo was using .git/hooks; keep honouring it.
+  const chainTarget = chained ?? path.join(repo, ".git", "hooks");
+  for (const hook of GIT_HOOKS) {
+    const target = path.join(dir, hook);
+    writeFileSync(target, repoDispatcherScript(binary, chainTarget), "utf8");
+    chmodSync(target, 0o755);
+  }
+  setLocalHooksPath(repo, dir);
+  return { hooksDir: dir, chained, alreadyOurs };
+}
+
+export interface RepoUninstallResult {
+  restored: string | null;
+  wasOurs: boolean;
+}
+
+export function uninstallRepoDispatcher(repo: string, repoHooksRoot: string): RepoUninstallResult {
+  const dir = path.join(repoHooksRoot, repoSlug(repo));
+  const current = localHooksPath(repo);
+  const wasOurs = current !== null && path.resolve(current) === path.resolve(dir);
+  if (!wasOurs) return { restored: null, wasOurs: false };
+
+  const saved = path.join(dir, ORIGINAL);
+  const original = existsSync(saved) ? readFileSync(saved, "utf8").trim() : "";
+  if (original) setLocalHooksPath(repo, original);
+  else unsetLocalHooksPath(repo);
+  rmSync(dir, { recursive: true, force: true });
+  return { restored: original || null, wasOurs: true };
+}
+
+/**
+ * Is this repository actually covered — by the global dispatcher, or its own?
+ *
+ * Answers the question `doctor` was getting wrong: not "is a global hooksPath
+ * set" but "will a hook here reach us".
+ */
+export function repoCoverage(
+  repo: string,
+  globalDir: string | null,
+): { covered: boolean; effective: string | null; reason: string } {
+  const local = localHooksPath(repo);
+  if (local) {
+    const dir = resolveHooksPath(repo, local);
+    if (isOurHooksDir(dir)) return { covered: true, effective: dir, reason: "repo-scoped dispatcher" };
+    return {
+      covered: false,
+      effective: dir,
+      reason: "this repo sets its own core.hooksPath, which overrides the global one",
+    };
+  }
+  if (globalDir && isOurHooksDir(globalDir)) {
+    return { covered: true, effective: globalDir, reason: "global dispatcher" };
+  }
+  return { covered: false, effective: globalDir, reason: "no dispatcher installed" };
 }

@@ -10,6 +10,7 @@
  * the user's git command, and one `git rebase` can fire dozens of them, so the
  * only correct amount of work here is "almost none".
  */
+import { isUnder } from "../paths.js";
 import type { GitHook, HookEvent, HookHandler } from "../hooks.js";
 import { Queue } from "../queue.js";
 
@@ -44,7 +45,7 @@ export function createIndexHandler(opts: IndexHandlerOptions): HookHandler {
       // The root check is a guard, not an optimisation: a global hooksPath
       // fires in *every* repo on the machine, including ones the user never
       // intended to index.
-      if (!event.repoPath.startsWith(opts.root)) return;
+      if (!isUnder(event.repoPath, opts.root)) return;
       queue.enqueue({
         repoPath: event.repoPath,
         hook: event.hook,
