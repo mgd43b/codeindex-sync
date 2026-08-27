@@ -775,8 +775,11 @@ async function listAll(cfg: Config, opts: ListOpts): Promise<void> {
   if (shown.length === 0) {
     ui.empty(opts.stale ? "nothing needs attention" : "no indexes reported");
   } else {
+    // Bold, not dim: `dim` is this codebase's mark for secondary data, and the
+    // collection column uses it — a dim header made the two indistinguishable.
+    // Three levels now read as a hierarchy: bold header, plain data, dim aside.
     const header = ["STATUS", "AGE", "FILES", "PROJECT", "COLLECTION"].map((h) =>
-      ui.style.dim(h),
+      ui.style.bold(h),
     );
     ui.table(
       [
