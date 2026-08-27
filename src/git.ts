@@ -93,6 +93,11 @@ export function goneBranches(repo: string): string[] {
     .filter(Boolean);
 }
 
+/** Resolved HEAD commit, or null (unborn branch, not a repo, deleted dir). */
+export function currentHead(dir: string): string | null {
+  return git(["rev-parse", "HEAD"], dir);
+}
+
 export function isDirty(dir: string): boolean {
   const out = git(["status", "--porcelain"], dir);
   return out !== null && out.length > 0;

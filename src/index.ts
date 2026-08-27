@@ -31,3 +31,5 @@ export { createIndexHandler } from "./handlers/index-handler.js";
 export type { IndexHandlerOptions } from "./handlers/index-handler.js";
 export { buildHookRegistry, buildProviderRegistry } from "./runtime.js";
 export { defaultHooksDir, dispatcherScript, installDispatcher, isOurHooksDir } from "./install.js";
+export { fingerprint, serialiseFingerprint, unchanged } from "./fingerprint.js";
+export type { Fingerprint } from "./fingerprint.js";

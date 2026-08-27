@@ -29,6 +29,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { shouldCoalesce } from "./coalesce.js";
+import { fingerprint, serialiseFingerprint, unchanged } from "./fingerprint.js";
 import type { Logger } from "./logger.js";
 import type { Paths } from "./paths.js";
 import type { IndexProvider, ProviderRegistry } from "./provider.js";
@@ -49,6 +50,7 @@ export interface WorkerOptions {
 export type JobResult =
   | { outcome: "indexed"; summary: string }
   | { outcome: "coalesced"; reason: string }
+  | { outcome: "unchanged" }
   | { outcome: "busy" }
   | { outcome: "retry"; attempt: number; error: string }
   | { outcome: "failed"; error: string }
@@ -80,6 +82,28 @@ export class Worker {
     } catch {
       return undefined;
     }
+  }
+
+  /** Fingerprint recorded at the last successful index, if any. */
+  lastFingerprint(repoPath: string): string | undefined {
+    try {
+      return readFileSync(
+        path.join(this.opts.paths.lastIndexed, `${jobKey(repoPath)}.fp`),
+        "utf8",
+      ).trim() || undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private recordFingerprint(repoPath: string): void {
+    const fp = fingerprint(repoPath);
+    if (!fp) return;
+    writeFileSync(
+      path.join(this.opts.paths.lastIndexed, `${jobKey(repoPath)}.fp`),
+      `${serialiseFingerprint(fp)}\n`,
+      "utf8",
+    );
   }
 
   private recordIndexStart(repoPath: string, startedAt: string): void {
@@ -144,6 +168,17 @@ export class Worker {
       return { outcome: "coalesced", reason: decision.reason };
     }
 
+    // Nothing changed? A hook fired for activity that never touched this repo —
+    // overwhelmingly worktree churn. Settle it before walking the tree.
+    if (!job.full) {
+      const fp = fingerprint(job.repoPath);
+      if (unchanged(fp, this.lastFingerprint(job.repoPath))) {
+        logger.tag("unchanged", `${job.repoPath} — HEAD unmoved and tree clean; nothing to index`);
+        this.queue.remove(job.repoPath);
+        return { outcome: "unchanged" };
+      }
+    }
+
     // Dangling worktree registrations are the precondition for the indexer
     // being handed a deleted working directory.
     try {
@@ -185,6 +220,7 @@ export class Worker {
 
     if (result.status === "ok") {
       this.recordIndexStart(job.repoPath, startedAt);
+      this.recordFingerprint(job.repoPath);
       logger.tag("ok", `${job.repoPath} — ${result.summary || "no summary"}`);
       this.queue.remove(job.repoPath);
       return { outcome: "indexed", summary: result.summary };

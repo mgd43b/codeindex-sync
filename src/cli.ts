@@ -12,7 +12,7 @@
  *  4. A user never sees a stack trace.
  */
 import { Command } from "commander";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { ConfigError, configPath, loadConfig, saveConfig, type Config } from "./config.js";
 import {
@@ -244,6 +244,68 @@ program
       ui.line();
       ui.line(`  ${ui.style.dim("retry:")} ${ui.style.cyan("codeindex-sync retry")}`);
     }
+  });
+
+// ── list ──────────────────────────────────────────────────────────────────
+program
+  .command("list [repo]")
+  .description("Show what each provider knows about a repository")
+  .action(async (repo: string | undefined) => {
+    const cfg = config();
+    requireProviders(cfg);
+    const target = resolveRepo(repo ?? process.cwd());
+    ui.heading(path.basename(target));
+    const rows: string[][] = [];
+    for (const provider of registryFrom(cfg).all()) {
+      if (!(await provider.detect(target))) {
+        rows.push([ui.style.dim(provider.name), ui.style.dim("does not claim this repo"), ""]);
+        continue;
+      }
+      const status = await provider.status(target);
+      if (!status) {
+        rows.push([ui.style.cyan(provider.name), ui.style.dim("no status reported"), ""]);
+        continue;
+      }
+      const state = status.incomplete
+        ? ui.style.yellow("incomplete")
+        : status.indexed
+          ? ui.style.green("indexed")
+          : ui.style.dim("not indexed");
+      const detail = [
+        status.files === undefined ? "" : `${status.files} files`,
+        status.chunks === undefined ? "" : `${status.chunks} chunks`,
+      ]
+        .filter(Boolean)
+        .join(", ");
+      rows.push([ui.style.cyan(provider.name), state, detail]);
+    }
+    ui.table(rows);
+    if (rows.some((r) => ui.stripAnsi(r[1] ?? "").includes("incomplete"))) {
+      ui.line();
+      ui.warn(
+        "an index is incomplete — a previous run was interrupted",
+        `only a full reindex clears this: ${ui.style.cyan("codeindex-sync sync --full")}`,
+      );
+    }
+  });
+
+// ── log ───────────────────────────────────────────────────────────────────
+program
+  .command("log [lines]")
+  .description("Show the worker log")
+  .action((lines: string | undefined) => {
+    const file = resolvePaths().log;
+    if (!existsSync(file)) {
+      ui.empty("no log yet", "codeindex-sync sync <repo>");
+      return;
+    }
+    const n = Number.parseInt(lines ?? "40", 10);
+    const all = readFileSync(file, "utf8").split("\n").filter(Boolean);
+    if (all.length === 0) {
+      ui.empty("log is empty");
+      return;
+    }
+    for (const l of all.slice(-(Number.isFinite(n) ? n : 40))) ui.line(`  ${l}`);
   });
 
 // ── sync ──────────────────────────────────────────────────────────────────
