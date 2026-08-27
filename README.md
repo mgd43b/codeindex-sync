@@ -5,6 +5,11 @@ Keep code indexes in sync with git activity — for any MCP backend.
 Commit, merge, rebase or switch branches, and the affected repository is
 re-indexed in the background within seconds. Nothing to run by hand.
 
+Any indexer that speaks MCP works, described entirely in config.
+[SocratiCode](https://github.com/giancarloerra/socraticode) is the backend this
+was built against and ships as a built-in preset, so that setup is four
+commands:
+
 ```bash
 npm install -g codeindex-sync
 codeindex-sync init --preset socraticode   # configure a backend

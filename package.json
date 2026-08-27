@@ -1,7 +1,7 @@
 {
   "name": "codeindex-sync",
   "version": "0.1.0",
-  "description": "Git-hook-driven index sync worker for MCP code-search backends",
+  "description": "Git-hook-driven index sync for MCP code-search backends such as SocratiCode",
   "type": "module",
   "license": "MIT",
   "bin": {
@@ -31,7 +31,10 @@
     "code-search",
     "semantic-search",
     "git-hooks",
-    "indexing"
+    "indexing",
+    "socraticode",
+    "qdrant",
+    "developer-tools"
   ],
   "repository": {
     "type": "git",
@@ -49,5 +52,6 @@
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.68.0",
     "vitest": "^4.1.11"
-  }
+  },
+  "homepage": "https://github.com/mgd43b/codeindex-sync#readme"
 }
