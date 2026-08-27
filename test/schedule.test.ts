@@ -8,11 +8,13 @@
  * this feature exists.
  */
 import { describe, expect, it } from "vitest";
+import path from "node:path";
 import {
   DEFAULT_INTERVAL,
   LABEL,
   detectScheduler,
   plistContent,
+  schedulerPath,
   serviceContent,
   timerContent,
 } from "../src/schedule.js";
@@ -72,5 +74,43 @@ describe("defaults", () => {
   it("uses an interval that is frequent but not busy", () => {
     expect(DEFAULT_INTERVAL).toBeGreaterThanOrEqual(30);
     expect(DEFAULT_INTERVAL).toBeLessThanOrEqual(600);
+  });
+});
+
+describe("schedulerPath", () => {
+  it("includes the directory node itself lives in", () => {
+    // The recorded binary is a Node script: its `env node` shebang still has to
+    // find node. A launchd job inherits only /usr/bin:/bin:/usr/sbin:/sbin, so
+    // without this the job exits 127 while every other check looks healthy.
+    expect(schedulerPath("/opt/homebrew/bin/codeindex-sync")).toContain(
+      path.dirname(process.execPath),
+    );
+  });
+
+  it("includes the binary's own directory, where npx usually sits", () => {
+    // The worker spawns the backend, typically via npx.
+    expect(schedulerPath("/some/prefix/bin/codeindex-sync")).toContain("/some/prefix/bin");
+  });
+
+  it("keeps the system directories as a fallback", () => {
+    const p = schedulerPath("/opt/homebrew/bin/codeindex-sync");
+    for (const d of ["/usr/bin", "/bin"]) expect(p.split(":")).toContain(d);
+  });
+
+  it("does not repeat a directory", () => {
+    const parts = schedulerPath("/usr/bin/codeindex-sync").split(":");
+    expect(parts.length).toBe(new Set(parts).size);
+  });
+});
+
+describe("units carry the PATH", () => {
+  it("plist sets EnvironmentVariables.PATH", () => {
+    expect(plistContent("/opt/homebrew/bin/codeindex-sync", 60)).toContain(
+      "<key>EnvironmentVariables</key>",
+    );
+  });
+
+  it("systemd service sets Environment=PATH", () => {
+    expect(serviceContent("/opt/homebrew/bin/codeindex-sync")).toMatch(/^Environment=PATH=/m);
   });
 });

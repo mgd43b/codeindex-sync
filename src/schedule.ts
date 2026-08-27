@@ -45,7 +45,32 @@ function xml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/**
+ * A PATH the scheduler can actually use.
+ *
+ * Recording an absolute binary path is necessary but not sufficient: that
+ * binary is a Node script whose `#!/usr/bin/env node` shebang still has to find
+ * `node`, and the worker then spawns the backend (typically via `npx`). A
+ * launchd job inherits only /usr/bin:/bin:/usr/sbin:/sbin, where none of those
+ * live under Homebrew or nvm — the job exits 127 before doing anything, and
+ * every other check still looks healthy.
+ */
+export function schedulerPath(binary: string): string {
+  const dirs = [
+    path.dirname(process.execPath), // node itself
+    path.dirname(binary), // the CLI, and usually npx/npm beside it
+    "/usr/local/bin",
+    "/opt/homebrew/bin",
+    "/usr/bin",
+    "/bin",
+    "/usr/sbin",
+    "/sbin",
+  ];
+  return [...new Set(dirs)].join(":");
+}
+
 export function plistContent(binary: string, interval: number): string {
+  const envPath = schedulerPath(binary);
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -56,6 +81,10 @@ export function plistContent(binary: string, interval: number): string {
     <string>${xml(binary)}</string>
     <string>drain</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>${xml(envPath)}</string>
+  </dict>
   <key>StartInterval</key><integer>${interval}</integer>
   <key>RunAtLoad</key><true/>
   <key>ProcessType</key><string>Background</string>
@@ -70,6 +99,7 @@ Description=Drain the codeindex-sync queue
 
 [Service]
 Type=oneshot
+Environment=PATH=${schedulerPath(binary)}
 ExecStart=${binary} drain
 `;
 }
