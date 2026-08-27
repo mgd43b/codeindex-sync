@@ -5,11 +5,21 @@ Keep code indexes in sync with git activity — for any MCP backend.
 Commit, merge, rebase or switch branches, and the affected repository is
 re-indexed in the background within seconds. Nothing to run by hand.
 
-```
+```bash
 npm install -g codeindex-sync
-codeindex-sync init --preset socraticode
-codeindex-sync doctor
+codeindex-sync init --preset socraticode   # configure a backend
+codeindex-sync install                     # install the git hooks
+codeindex-sync doctor                      # check it all works
 ```
+
+Two steps people miss, both covered in the guides below: backend URLs go in the
+config's `env` block (git hooks are not a login shell, so your exported
+variables are invisible to the indexer), and something has to **drain the
+queue** — hooks enqueue but never index inline, so a git command never waits on
+a backend.
+
+**Guides:** [Using it with SocratiCode](docs/socraticode.md) ·
+[Adding a backend or hook handler](docs/extending.md)
 
 > Not affiliated with, or endorsed by, any backend it drives. codeindex-sync
 > contains no third-party backend code — it spawns backends as separate

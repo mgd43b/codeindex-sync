@@ -77,6 +77,34 @@ describe("basics", () => {
   });
 });
 
+describe("command dispatch", () => {
+  it("a bare invocation runs status", () => {
+    const r = cli([]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/Worker/);
+  });
+
+  it("a misspelled command errors and suggests the real one", () => {
+    // Regression: with commander's `isDefault` on status, this exited 0 and
+    // silently printed the queue — a typo looked like it had worked.
+    const r = cli(["statsu"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/unknown command/);
+    expect(r.out).toMatch(/status/);
+    expect(r.out).not.toMatch(/Worker/);
+  });
+
+  it("an unknown command with no near match still errors", () => {
+    const r = cli(["nonsense-command"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/unknown command/);
+  });
+
+  it("a leading flag is not mistaken for a command", () => {
+    expect(cli(["--version"]).code).toBe(0);
+  });
+});
+
 describe("first run teaches rather than just reporting emptiness", () => {
   it("status names the command that fills the queue", () => {
     const r = cli(["status"]);

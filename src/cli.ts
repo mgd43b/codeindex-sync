@@ -209,7 +209,7 @@ program
 
 // ── status ────────────────────────────────────────────────────────────────
 program
-  .command("status", { isDefault: true })
+  .command("status")
   .description("Show the queue, worker and recent failures")
   .action(() => {
     const cfg = config();
@@ -566,6 +566,21 @@ program
     });
   });
 
-program.parseAsync(process.argv).catch((err: unknown) => {
+/**
+ * Bare `codeindex-sync` should mean `status` — but a *misspelled* command must
+ * be an error, not a silent fallback to it. Commander's `isDefault` cannot tell
+ * the two apart: with it set, `codeindex-sync statsu` prints the queue and
+ * exits 0, so a typo looks like it worked. Applying the default here instead
+ * leaves every unrecognised word on commander's own error path, which also
+ * suggests the nearest real command.
+ */
+function withDefaultCommand(argv: string[]): string[] {
+  const firstWord = argv.slice(2).find((a) => !a.startsWith("-"));
+  return firstWord ? argv : [...argv, "status"];
+}
+
+program.showSuggestionAfterError(true);
+
+program.parseAsync(withDefaultCommand(process.argv)).catch((err: unknown) => {
   ui.fail(err instanceof Error ? err.message : String(err));
 });
