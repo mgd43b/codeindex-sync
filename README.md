@@ -59,9 +59,20 @@ behaviour here comes from a failure seen in production:
 | `worktrees [--prune]` | Inspect worktrees; drop dangling registrations |
 | `hook <name>` | Entry point for git hooks (enqueues; never indexes inline) |
 
-## Adding a backend
+## Backends
 
-Usually no code — describe the MCP server in config:
+| Backend | Status |
+|---|---|
+| [SocratiCode](https://github.com/giancarloerra/socraticode) | Built-in preset — `init --preset socraticode` |
+| Any other MCP indexer | Config only, no code — `init --preset generic-mcp` |
+
+There is one built-in preset because there is one backend this has been run
+against in earnest. That is a statement about what has been *verified*, not
+about what works: the worker knows nothing about SocratiCode, and the generic
+path is exercised in CI against stub MCP servers with arbitrary tool names.
+
+The whole contract is **one MCP tool that re-indexes a path**. Point `update` at
+it and you have a working backend:
 
 ```json
 {
@@ -75,8 +86,13 @@ Usually no code — describe the MCP server in config:
 }
 ```
 
-See [docs/extending.md](docs/extending.md) for the full field reference, plus how
-to write a hook handler for something other than indexing.
+`index` (full rebuild) and `status` (chunk counts for `list`) are optional and
+improve behaviour where present. `detectFiles` is how a provider decides a
+repository is its own; without it, it claims every repository under `root`.
+
+If you get another backend working, a preset is a few lines of config and a
+welcome PR — see [docs/extending.md](docs/extending.md) for the full field
+reference, plus how to write a hook handler for something other than indexing.
 
 ## Design
 
