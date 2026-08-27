@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -159,5 +159,25 @@ describe("hook coverage (core.hooksPath replaces .git/hooks entirely)", () => {
       // stops vetoing the commit.
       expect(script).toContain("exit $?");
     }
+  });
+});
+
+describe("replacing another tool's hooks", () => {
+  it("does not write through a symlink into the other tool's script", () => {
+    // The bash implementation this replaces fills its hooks dir with symlinks
+    // to one dispatcher. writeFileSync follows symlinks, so a naive write
+    // destroys that script through the link — unrecoverably, since uninstall
+    // would then have nothing to restore.
+    const dir = mkdtempSync(path.join(tmpdir(), "codeindex-symlink-"));
+    const other = path.join(dir, "other-dispatch");
+    writeFileSync(other, "#!/bin/sh\n# ORIGINAL\n", "utf8");
+    symlinkSync("other-dispatch", path.join(dir, "post-commit"));
+
+    installDispatcher(dir);
+
+    expect(readFileSync(other, "utf8")).toContain("ORIGINAL");
+    expect(lstatSync(path.join(dir, "post-commit")).isSymbolicLink()).toBe(false);
+    expect(readFileSync(path.join(dir, "post-commit"), "utf8")).toContain(MARKER);
+    rmSync(dir, { recursive: true, force: true });
   });
 });

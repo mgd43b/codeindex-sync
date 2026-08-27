@@ -74,6 +74,27 @@ exit 0
 `;
 }
 
+
+/**
+ * Write a hook, replacing whatever is at that path.
+ *
+ * The unlink is load-bearing. Other tools (including the bash implementation
+ * this replaces) populate a hooks directory with *symlinks* to one dispatcher.
+ * writeFileSync follows a symlink, so writing straight to `post-commit` would
+ * overwrite that tool's script through the link — destroying it, while leaving
+ * the symlink in place pointing at our content. Replacing the entry keeps the
+ * other tool's file intact so uninstalling can leave a recoverable state.
+ */
+function writeHook(target: string, content: string): void {
+  try {
+    rmSync(target, { force: true });
+  } catch {
+    // Nothing there, or unremovable; the write below reports either way.
+  }
+  writeFileSync(target, content, "utf8");
+  chmodSync(target, 0o755);
+}
+
 export interface InstallResult {
   hooksDir: string;
   installed: string[];
@@ -93,8 +114,7 @@ export function installDispatcher(
 ): InstallResult {
   mkdirSync(hooksDir, { recursive: true });
   const dispatcher = path.join(hooksDir, "codeindex-sync-dispatch");
-  writeFileSync(dispatcher, dispatcherScript(binary), "utf8");
-  chmodSync(dispatcher, 0o755);
+  writeHook(dispatcher, dispatcherScript(binary));
 
   const installed: string[] = [];
   const indexing = new Set<string>(GIT_HOOKS);
@@ -102,8 +122,7 @@ export function installDispatcher(
     const target = path.join(hooksDir, hook);
     // A copy rather than a symlink: symlinks in hooksDir behave inconsistently
     // across git versions and filesystems.
-    writeFileSync(target, dispatcherScript(binary, indexing.has(hook)), "utf8");
-    chmodSync(target, 0o755);
+    writeHook(target, dispatcherScript(binary, indexing.has(hook)));
     installed.push(hook);
   }
   return { hooksDir, installed };
@@ -212,8 +231,7 @@ export function installRepoDispatcher(
   const indexing = new Set<string>(GIT_HOOKS);
   for (const hook of ALL_GIT_HOOKS) {
     const target = path.join(dir, hook);
-    writeFileSync(target, repoDispatcherScript(binary, chainTarget, indexing.has(hook)), "utf8");
-    chmodSync(target, 0o755);
+    writeHook(target, repoDispatcherScript(binary, chainTarget, indexing.has(hook)));
   }
   setLocalHooksPath(repo, dir);
   return { hooksDir: dir, chained, alreadyOurs };
