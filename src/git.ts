@@ -12,6 +12,21 @@
 import { execFileSync } from "node:child_process";
 import path from "node:path";
 
+/**
+ * Run git, never taking a lock that is merely an optimisation.
+ *
+ * `git status` refreshes the index and writes the result back, which requires
+ * `.git/index.lock`. git(1) is explicit about the consequence: "When status is
+ * run in the background, the lock held during the write may conflict with other
+ * simultaneous processes, causing them to fail."
+ *
+ * That is exactly this tool's situation — a background worker running status
+ * against every repository on a timer — and the failure lands on the user, in
+ * their own terminal, as "Another git process seems to be running", with no
+ * hint that an indexer caused it. GIT_OPTIONAL_LOCKS=0 suppresses only locks
+ * git considers optional, so mutating commands (worktree remove, branch -D,
+ * config) still take the locks they genuinely need.
+ */
 function git(args: string[], cwd?: string): string | null {
   try {
     return execFileSync("git", args, {
@@ -19,6 +34,7 @@ function git(args: string[], cwd?: string): string | null {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
       timeout: 30_000,
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" },
     }).trim();
   } catch {
     return null;

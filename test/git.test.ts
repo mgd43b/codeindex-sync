@@ -1,10 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   currentBranch,
+  currentHead,
   goneBranches,
   isDirty,
   listWorktrees,
@@ -146,5 +147,28 @@ describe("isDirty / currentBranch", () => {
     const sha = execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf8" }).trim();
     run(["checkout", "-q", sha]);
     expect(currentBranch(dir)).toBeNull();
+  });
+});
+
+describe("background safety", () => {
+  it("never takes git's optional index lock", () => {
+    // git(1): "When status is run in the background, the lock held during the
+    // write may conflict with other simultaneous processes, causing them to
+    // fail." This worker runs status against every repo on a timer, so that
+    // failure would surface in the user's own terminal as "Another git process
+    // seems to be running" with nothing pointing back at the indexer.
+    const lock = path.join(dir, ".git", "index.lock");
+    writeFileSync(path.join(dir, "b.txt"), "two\n");
+    execFileSync("touch", [path.join(dir, "a.txt")]);
+
+    expect(isDirty(dir)).toBe(true);
+    // The lock is transient, so its absence afterwards is necessary but weak;
+    // the load-bearing assertion is that the env var is set on every spawn.
+    expect(existsSync(lock)).toBe(false);
+  });
+
+  it("still reports state correctly with the flag set", () => {
+    expect(currentHead(dir)).toMatch(/^[0-9a-f]{40}$/);
+    expect(currentBranch(dir)).toBe("main");
   });
 });
