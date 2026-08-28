@@ -53,5 +53,9 @@
     "typescript-eslint": "^8.68.0",
     "vitest": "^4.1.11"
   },
-  "homepage": "https://github.com/mgd43b/codeindex-sync#readme"
+  "homepage": "https://github.com/mgd43b/codeindex-sync#readme",
+  "author": "Matthew Dickinson (https://github.com/mgd43b)",
+  "bugs": {
+    "url": "https://github.com/mgd43b/codeindex-sync/issues"
+  }
 }
