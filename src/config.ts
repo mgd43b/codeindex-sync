@@ -96,6 +96,7 @@ function validateProvider(p: unknown, index: number): McpProviderConfig {
   if (typeof o["description"] === "string") cfg.description = o["description"];
   if (typeof o["repoArg"] === "string") cfg.repoArg = o["repoArg"];
   if (Array.isArray(o["detectFiles"])) cfg.detectFiles = o["detectFiles"] as string[];
+  if (typeof o["markerContent"] === "string") cfg.markerContent = o["markerContent"];
   if (Array.isArray(o["busyMarkers"])) cfg.busyMarkers = o["busyMarkers"] as string[];
   if (Array.isArray(o["asyncIndexMarkers"])) {
     cfg.asyncIndexMarkers = o["asyncIndexMarkers"] as string[];

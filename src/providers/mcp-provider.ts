@@ -70,6 +70,19 @@ export interface McpProviderConfig {
    * only one provider is configured.
    */
   detectFiles?: string[];
+  /**
+   * What `claim` writes into `detectFiles[0]` to opt a repository in.
+   *
+   * The file NAME is already `detectFiles[0]`; this is what goes inside it, and
+   * that part is irreducibly backend-specific — SocratiCode pins a collection
+   * id, another backend might want something else or nothing at all. Keeping it
+   * as data is what stops `claim` from having to know any product's schema.
+   * `${name}` expands to the repository's directory name.
+   *
+   * Omit it and `claim` says it cannot write the marker for you, rather than
+   * inventing a format the backend will not understand.
+   */
+  markerContent?: string;
   timeoutMs?: number;
   /**
    * Substrings marking a "busy" reply rather than a failure: the backend holds
@@ -117,6 +130,15 @@ export function parseProjectListing(text: string): IndexedProject[] {
     if (pathLine?.[1]) {
       current = { path: pathLine[1] };
       out.push(current);
+      continue;
+    }
+    // A record header that is NOT a path. A backend may print a placeholder for
+    // an index whose path it no longer knows ("(path unknown — indexed before
+    // path tracking)"), and its details belong to that record, not the one
+    // above — absorbing them silently rewrote a real project's collection in
+    // `list --all`. Nothing here can be attributed to a path, so drop it.
+    if (/^\s*[-*\u2022]\s+\S/.test(raw)) {
+      current = undefined;
       continue;
     }
     if (!current) continue;
