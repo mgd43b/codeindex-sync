@@ -97,6 +97,11 @@ function validateProvider(p: unknown, index: number): McpProviderConfig {
   if (typeof o["repoArg"] === "string") cfg.repoArg = o["repoArg"];
   if (Array.isArray(o["detectFiles"])) cfg.detectFiles = o["detectFiles"] as string[];
   if (Array.isArray(o["busyMarkers"])) cfg.busyMarkers = o["busyMarkers"] as string[];
+  if (Array.isArray(o["asyncIndexMarkers"])) {
+    cfg.asyncIndexMarkers = o["asyncIndexMarkers"] as string[];
+  }
+  if (Array.isArray(o["progressMarkers"])) cfg.progressMarkers = o["progressMarkers"] as string[];
+  if (typeof o["pollIntervalMs"] === "number") cfg.pollIntervalMs = o["pollIntervalMs"];
   if (typeof o["timeoutMs"] === "number") cfg.timeoutMs = o["timeoutMs"];
   if (typeof o["env"] === "object" && o["env"] !== null) {
     cfg.env = o["env"] as Record<string, string>;

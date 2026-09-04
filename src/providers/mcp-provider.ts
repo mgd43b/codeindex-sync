@@ -7,11 +7,33 @@
  *
  * Nothing here names a specific product. A concrete backend is a config entry;
  * see `presets.ts` for ready-made ones.
+ *
+ * ## Asynchronous index tools
+ *
+ * A backend's "full index" tool may be fire-and-forget: it starts the work on
+ * its own event loop and returns in about a second with "indexing started".
+ * Taking that reply at face value is a silent data-loss bug — the session is
+ * closed, the child is reaped milliseconds into a job that needed minutes, and
+ * an empty-but-created index is reported as a success.
+ *
+ * So a tool reply is not evidence that the work happened. After invoking the
+ * index tool this class polls the configured `status` tool until the backend
+ * stops reporting progress, and reports what *status* says rather than what the
+ * index call claimed. The polling happens on ONE session, because progress is
+ * typically per-process state: a second child would see a backend that has
+ * never indexed anything, and the first child is dead by then anyway.
  */
 import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { withMcp, type McpToolResult } from "../mcp.js";
+import { setTimeout as delay } from "node:timers/promises";
+import {
+  DEFAULT_TIMEOUT_MS,
+  withMcp,
+  type McpClientOptions,
+  type McpSession,
+  type McpToolResult,
+} from "../mcp.js";
 import type {
   IndexOutcome,
   IndexProvider,
@@ -54,6 +76,15 @@ export interface McpProviderConfig {
    * the job should be requeued, not counted as a failed attempt.
    */
   busyMarkers?: string[];
+  /**
+   * Substrings marking a reply that means "accepted, still running" rather than
+   * "done". See the note on asynchronous index tools at the top of this file.
+   */
+  asyncIndexMarkers?: string[];
+  /** Substrings in a `status` reply meaning work is still under way. */
+  progressMarkers?: string[];
+  /** Gap between `status` polls while waiting for an async tool to finish. */
+  pollIntervalMs?: number;
 }
 
 /**
@@ -126,6 +157,53 @@ function safeCwd(wanted?: string): string {
 
 const DEFAULT_BUSY_MARKERS = ["another indexer", "already in progress", "locked by", "BUSY"];
 
+/**
+ * A reply that means "started, not finished". Matched against the index tool's
+ * own answer; deliberately phrase-level rather than backend-specific, because
+ * every async tool has to say some version of this to be usable at all.
+ */
+const DEFAULT_ASYNC_INDEX_MARKERS = [
+  "in the background",
+  "running asynchronously",
+  "check progress",
+];
+
+/**
+ * A `status` reply that means work is still under way. "actively indexing" is
+ * here because a backend may report that *another* process holds the job —
+ * waiting for that to finish is right, and returning "done" while it runs is
+ * exactly the empty-index failure this polling exists to prevent.
+ */
+const DEFAULT_PROGRESS_MARKERS = ["in progress", "in-progress", "actively indexing"];
+
+const DEFAULT_POLL_INTERVAL_MS = 2_000;
+
+/**
+ * How long to keep polling for progress that has not appeared yet, as a
+ * multiple of the poll interval.
+ *
+ * There is a gap between an async tool returning and its progress state
+ * becoming visible — it typically takes a lock first. Polling once and
+ * believing the answer would race straight back into the bug, so a reply that
+ * announced background work is given this long to show something before we
+ * accept "nothing is running" at face value.
+ */
+const SETTLE_POLLS = 8;
+
+function matchesAny(text: string, markers: readonly string[]): boolean {
+  const hay = text.toLowerCase();
+  return markers.some((m) => hay.includes(m.toLowerCase()));
+}
+
+/** Sleep that gives up early when the caller aborts. */
+async function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  try {
+    await delay(ms, undefined, signal ? { signal } : {});
+  } catch {
+    // Aborted: the caller re-checks the signal and stops.
+  }
+}
+
 /** Pull "Added: 3" style counters out of a human-readable summary. */
 function extractNumber(text: string, ...labels: string[]): number | undefined {
   for (const label of labels) {
@@ -164,8 +242,26 @@ export class McpIndexProvider implements IndexProvider {
   }
 
   private isBusy(text: string): boolean {
-    const markers = this.cfg.busyMarkers ?? DEFAULT_BUSY_MARKERS;
-    return markers.some((m) => text.toLowerCase().includes(m.toLowerCase()));
+    return matchesAny(text, this.cfg.busyMarkers ?? DEFAULT_BUSY_MARKERS);
+  }
+
+  /**
+   * Options for one session.
+   *
+   * cwd prefers the repo: inheriting a hook's cwd is how the runtime ends up
+   * starting in a deleted worktree and dying before the backend loads. But the
+   * repo is not always there — `cleanup` acts on paths that are gone by
+   * definition — so fall back to somewhere that exists rather than spawning
+   * into ENOENT.
+   */
+  private sessionOpts(repoPath: string | undefined, timeoutMs: number | undefined): McpClientOptions {
+    return {
+      command: this.cfg.command,
+      args: this.cfg.args,
+      cwd: safeCwd(repoPath),
+      env: { ...process.env, ...this.cfg.env },
+      ...(timeoutMs === undefined ? {} : { timeoutMs }),
+    };
   }
 
   private async call(
@@ -173,28 +269,25 @@ export class McpIndexProvider implements IndexProvider {
     tool: string,
     args: Record<string, unknown>,
   ): Promise<McpToolResult> {
-    return withMcp(
-      {
-        command: this.cfg.command,
-        args: this.cfg.args,
-        // Prefer the repo: inheriting a hook's cwd is how the runtime ends up
-        // starting in a deleted worktree and dying before the backend loads.
-        // But the repo is not always there — `cleanup` acts on paths that are
-        // gone by definition — so fall back to somewhere that exists rather
-        // than spawning into ENOENT.
-        cwd: safeCwd(repoPath),
-        env: { ...process.env, ...this.cfg.env },
-        ...(this.cfg.timeoutMs === undefined ? {} : { timeoutMs: this.cfg.timeoutMs }),
-      },
-      (s) => s.callTool(tool, args),
-    );
+    return withMcp(this.sessionOpts(repoPath, this.cfg.timeoutMs), (s) => s.callTool(tool, args));
   }
 
   async index(req: IndexRequest): Promise<IndexOutcome> {
-    const tool = req.full ? (this.cfg.tools.index ?? this.cfg.tools.update) : this.cfg.tools.update;
+    const indexTool = req.full ? this.cfg.tools.index : undefined;
+    const tool = indexTool ?? this.cfg.tools.update;
     let res: McpToolResult;
     try {
-      res = await this.call(req.repoPath, tool, this.repoArgs(req.repoPath));
+      // One session for the tool call AND the polling that confirms it
+      // finished. Not two: a backend's progress state is per-process, so a
+      // second child sees a backend that has never indexed anything.
+      res = await withMcp(
+        this.sessionOpts(req.repoPath, this.cfg.timeoutMs),
+        async (session) => {
+          const started = await session.callTool(tool, this.repoArgs(req.repoPath));
+          if (started.isError || this.isBusy(started.text)) return started;
+          return this.awaitCompletion(session, req, started, indexTool !== undefined);
+        },
+      );
     } catch (err) {
       return {
         status: "failed",
@@ -216,6 +309,85 @@ export class McpIndexProvider implements IndexProvider {
     if (files !== undefined) outcome.filesIndexed = files;
     if (chunks !== undefined) outcome.chunks = chunks;
     return outcome;
+  }
+
+  /**
+   * Wait until the backend stops reporting work, then answer with what `status`
+   * says rather than what the tool call claimed.
+   *
+   * Polling is skipped for a synchronous `update`, which is the hot path: hooks
+   * fire constantly and that reply is already the truth. It is NOT skipped for
+   * a synchronous index tool — one extra call costs nothing on a full reindex
+   * and upgrades the summary from "started" to real counters.
+   *
+   * The loop is bounded three ways, because a wait is the one thing here that
+   * could wedge the queue: the caller's abort signal, an explicit deadline of
+   * the configured timeout, and — underneath both — the session's own hard
+   * timer, which kills the child and makes every later call fail immediately.
+   * Any of the three ends as a failure, never as a silent success.
+   */
+  private async awaitCompletion(
+    session: McpSession,
+    req: IndexRequest,
+    started: McpToolResult,
+    usedIndexTool: boolean,
+  ): Promise<McpToolResult> {
+    const asyncReply = matchesAny(
+      started.text,
+      this.cfg.asyncIndexMarkers ?? DEFAULT_ASYNC_INDEX_MARKERS,
+    );
+    if (!usedIndexTool && !asyncReply) return started;
+
+    const statusTool = this.cfg.tools.status;
+    // Nothing to poll. The reply stands as the only account available, which is
+    // why a backend with an async index tool wants a `status` tool configured.
+    if (!statusTool) return started;
+
+    const progressMarkers = this.cfg.progressMarkers ?? DEFAULT_PROGRESS_MARKERS;
+    const interval = this.cfg.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    const timeoutMs = this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    const deadline = Date.now() + timeoutMs;
+    const settleUntil = Date.now() + interval * SETTLE_POLLS;
+    let sawProgress = false;
+
+    for (;;) {
+      // Sleep first: an async tool returns before its progress state is
+      // visible, so an immediate poll can see a backend that looks idle.
+      // Then check the guards, so neither an abort nor the deadline can be
+      // followed by one more call into a backend that may never answer.
+      await sleep(interval, req.signal);
+      if (req.signal?.aborted) {
+        return { isError: true, text: "aborted while waiting for the backend to finish" };
+      }
+      if (Date.now() >= deadline) {
+        return {
+          isError: true,
+          text:
+            `backend still had work outstanding after ${Math.round(timeoutMs / 1000)}s; ` +
+            `giving up rather than reporting an unfinished index as done`,
+        };
+      }
+
+      const now = await session.callTool(statusTool, this.repoArgs(req.repoPath));
+      // The session died or timed out. Reporting that is the whole point.
+      if (now.isError) return now;
+
+      if (matchesAny(now.text, progressMarkers)) {
+        sawProgress = true;
+        continue;
+      }
+      // Idle. Believe it once we have watched the work run, or once a reply
+      // that promised background work has had its settle window to show it.
+      if (!sawProgress && asyncReply && Date.now() < settleUntil) continue;
+
+      // A backend that still calls its own index incomplete has not succeeded,
+      // whatever the tool call said. Failing loudly beats an empty index that
+      // reports as healthy.
+      if (/incomplete/i.test(now.text)) {
+        return { isError: true, text: `index still incomplete after ${statusTool}\n${now.text}` };
+      }
+      return now;
+    }
   }
 
   async status(repoPath: string): Promise<RepoStatus | null> {
@@ -251,15 +423,8 @@ export class McpIndexProvider implements IndexProvider {
     const tool = this.cfg.tools.list;
     if (!tool) return null;
     try {
-      const res = await withMcp(
-        {
-          command: this.cfg.command,
-          args: this.cfg.args,
-          cwd: safeCwd(),
-          env: { ...process.env, ...this.cfg.env },
-          timeoutMs: this.cfg.timeoutMs ?? 30_000,
-        },
-        (s) => s.callTool(tool, {}),
+      const res = await withMcp(this.sessionOpts(undefined, this.cfg.timeoutMs ?? 30_000), (s) =>
+        s.callTool(tool, {}),
       );
       if (res.isError) return null;
       return parseProjectListing(res.text);
@@ -286,13 +451,7 @@ export class McpIndexProvider implements IndexProvider {
     const probeDir = process.cwd();
     try {
       const res = await withMcp(
-        {
-          command: this.cfg.command,
-          args: this.cfg.args,
-          cwd: safeCwd(probeDir),
-          env: { ...process.env, ...this.cfg.env },
-          timeoutMs: this.cfg.timeoutMs ?? 30_000,
-        },
+        this.sessionOpts(probeDir, this.cfg.timeoutMs ?? 30_000),
         async (s) => {
           const tool = this.cfg.tools.health ?? this.cfg.tools.status;
           if (!tool) return { isError: false, text: "handshake ok" };
