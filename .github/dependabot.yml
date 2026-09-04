@@ -24,6 +24,16 @@ updates:
       # because it type-checks once against whatever version is installed.
       - dependency-name: "@types/node"
         update-types: [version-update:semver-major]
+      # A TypeScript major is uninstallable until the lint toolchain catches
+      # up: typescript-eslint pins its peer to "<6.1.0", so npm ci dies with
+      # ERESOLVE before lint, typecheck, build or test ever run. Dependabot
+      # cannot see this — it resolves the lockfile, not the install — so it
+      # will re-propose the same dead PR every week (see PR #9, TS 7.0.2).
+      # Revisit when typescript-eslint widens the range. TS 7 is the Go
+      # rewrite, so that upgrade wants a deliberate look at emit and strict
+      # behaviour anyway, not a rubber-stamped bump.
+      - dependency-name: "typescript"
+        update-types: [version-update:semver-major]
 
   - package-ecosystem: github-actions
     directory: "/"
