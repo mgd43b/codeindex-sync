@@ -1,0 +1,43 @@
+name: release-please
+
+# Keeps a release PR open against main: it accumulates the conventional commits
+# landed since the last release, and merging it is what cuts the release. So the
+# version bump and the CHANGELOG are reviewed like any other change, and nothing
+# is ever released as a side effect of merging ordinary work.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      released: ${{ steps.release.outputs.release_created }}
+      tag: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        # Config lives in release-please-config.json and the current version in
+        # .release-please-manifest.json, rather than inline here, so the version
+        # release-please believes we are on is visible in the tree.
+
+  # A release created with the default GITHUB_TOKEN does not start other
+  # workflows, so release.yml's `release: published` trigger never fires for
+  # one. Calling it directly bridges that gap without a long-lived PAT, and
+  # keeps the publish going through exactly the checks a manual release does.
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.released == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      publish: true
+    permissions:
+      contents: read
+      # Trusted publishing needs the job's OIDC identity; a reusable workflow
+      # gets its permissions from the caller, so it has to be granted here.
+      id-token: write
+    secrets: inherit
