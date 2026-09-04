@@ -117,9 +117,17 @@ only if you intend it to actually publish.
 
 ### What release-please believes the current version is
 
-`.release-please-manifest.json`. It is seeded to `0.0.0` so the first release
-PR proposes `0.1.0`, matching the version already in `package.json`. After the
-first release, release-please maintains it and it should not be edited by hand.
+`.release-please-manifest.json`, seeded to `0.0.0`. That alone is *not* what
+makes the first release `0.1.0` — with no release to find, release-please falls
+back to its own initial version, which defaults to `1.0.0`. `initial-version`
+in `release-please-config.json` pins it to `0.1.0`, matching `package.json`.
+
+After the first release, release-please maintains the manifest and it should not
+be edited by hand.
+
+`include-component-in-tag` is false so tags are `v0.1.0` rather than
+`codeindex-sync-v0.1.0` — the component prefix is for monorepos releasing
+several packages from one repo.
 
 Never hand-edit `url` or `sha256` in the formula. A hash that disagrees with
 what npm serves fails at install time for every user simultaneously, and the
