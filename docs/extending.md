@@ -54,6 +54,13 @@ first one claiming a repo wins, in config order. A marker file is the usual
 mechanism — it also lets a repo opt in explicitly. An empty list means "claim
 any repo", which is fine when only one provider is configured.
 
+**`markerContent` is what lets `claim` write that marker for you.** The file name
+is already `detectFiles[0]`; this is what goes inside it, and that part is
+irreducibly backend-specific — SocratiCode pins a collection id, yours may want
+something else. `${name}` expands to the repository's directory name. Leave it
+out and `claim` says it cannot write the marker rather than inventing a format
+your backend will not understand.
+
 **`busyMarkers` prevents a real bug.** Most backends hold their own per-project
 lock. When another indexer holds it, the reply is *contention*, not failure — the
 job must be requeued without burning a retry attempt. Get this wrong and three

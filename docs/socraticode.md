@@ -106,9 +106,24 @@ chmod 600 ~/.config/codeindex-sync/config.json
 SocratiCode's preset claims a repo only if it contains `.socraticode.json`:
 
 ```bash
+codeindex-sync claim ~/code/my-project
+```
+
+That writes the marker for you, using the directory name as the id (`--id` to
+choose another). Equivalent to doing it by hand:
+
+```bash
 cd ~/code/my-project
 echo '{"projectId":"my-project"}' > .socraticode.json
 ```
+
+The command is worth preferring for one reason the manual form cannot manage: if
+the backend already holds an index for that path under a *hash-derived* name, it
+refuses rather than stranding it. Pinning an id moves the collection, and
+`cleanup` only ever reclaims indexes whose directory is gone — that one's is
+not, so nothing would ever reclaim it. Pass `--replace` to drop it first.
+`unclaim --remove` is the same care in reverse: it drops the index *before*
+removing the marker that makes it findable.
 
 This does two jobs. It opts the repo in, and it **pins the collection name**.
 Without it, SocratiCode derives the name from a hash of the absolute path — so
