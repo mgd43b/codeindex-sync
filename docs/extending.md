@@ -41,7 +41,8 @@ write code. Describe it in `~/.config/codeindex-sync/config.json`:
 
 **`tools.update` is the only required tool.** Everything else degrades: without
 `index`, a `--full` request falls back to `update`; without `status`, `list`
-reports nothing for that provider rather than failing.
+reports nothing for that provider rather than failing — and an asynchronous
+`index` cannot be verified, so configure `status` if you configure `index`.
 
 **`detectFiles` decides routing.** When several providers are configured, the
 first one claiming a repo wins, in config order. A marker file is the usual
@@ -52,6 +53,49 @@ any repo", which is fine when only one provider is configured.
 lock. When another indexer holds it, the reply is *contention*, not failure — the
 job must be requeued without burning a retry attempt. Get this wrong and three
 unlucky collisions park a perfectly healthy repository in `failed/`.
+
+**`asyncIndexMarkers` prevents a worse one.** A full-index tool is often
+fire-and-forget: it starts the work on the backend's own event loop and returns
+in about a second saying so. Taken at face value that reply is a silent
+data-loss bug — the session closes, the child is reaped moments into a job
+needing minutes, and an empty index reports as a success.
+
+So a reply is not evidence the work happened. After invoking `tools.index`,
+codeindex-sync polls `tools.status` **on the same session** until the backend
+stops reporting progress, and reports what status says. One session, because
+progress is usually per-process state: a second child would see a backend that
+has never indexed anything.
+
+Three fields tune it, and the defaults suit any backend that says the usual
+things ("in the background", "in progress"):
+
+| Field | Default | What it matches |
+| --- | --- | --- |
+| `asyncIndexMarkers` | `in the background`, `running asynchronously`, `check progress` | A reply meaning "started", not "done" |
+| `progressMarkers` | `in progress`, `in-progress`, `actively indexing` | A `status` reply meaning work is still running |
+| `pollIntervalMs` | `2000` | Cadence the status polls settle at (must be positive) |
+
+Polling starts immediately and backs off to `pollIntervalMs`, so a tool that
+already did the work before replying pays one extra call and no waiting, while a
+long job is not polled hard. Cheap early polls also matter for correctness: a run
+that starts and finishes between two polls was never *seen*, and an unseen run
+cannot be told apart from one that never started.
+
+Three consequences worth knowing:
+
+- An incremental `update` that answers synchronously is not polled — hooks fire
+  constantly and that reply is already the truth — but one whose reply matches
+  `asyncIndexMarkers` is.
+- "Done" is not merely "no progress marker". Re-indexing a repo that already has
+  an index reports a perfectly healthy one during the window before the new run
+  becomes visible, so a reply that announced background work must be watched
+  running before it counts as finished.
+- A run that stops having produced no index at all, or one the backend still
+  calls incomplete, is a failure — not a success with a small number in it.
+
+The wait is bounded by the caller's abort signal and by the session's own hard
+timer, which kills the child and makes every later call fail at once. Both end as
+a failure: a backend that never finishes must never look like one that did.
 
 **`env` exists because git hooks are not a login shell.** They never source
 `~/.bashrc`, `~/.zshenv` or any profile, so anything you export in a shell is
