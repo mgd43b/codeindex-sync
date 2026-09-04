@@ -1036,11 +1036,13 @@ program
       } else if (res.status === "unverified") {
         // Accepted, but nothing here proves it happened. Saying so beats a tick
         // the next `cleanup` run contradicts.
-        ui.warn(`${orphan.path} — ${res.detail ?? "could not confirm removal"}`);
+        ui.warn(`${orphan.path} — ${res.detail}`);
         unverified++;
       } else {
-        const why = res.detail ? ` — ${res.detail}` : "";
-        ui.bad(`could not remove ${orphan.path}${why}`, removalRemedy(cfg, orphan.provider));
+        ui.bad(
+          `could not remove ${orphan.path} — ${res.detail}`,
+          removalRemedy(cfg, orphan.provider),
+        );
       }
     }
     ui.line();

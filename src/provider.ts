@@ -62,12 +62,17 @@ export interface RepoStatus {
  * index is gone, it can leave it there while cheerfully acknowledging the call,
  * or it can accept the call somewhere we have no way to check. Only the first
  * may be shown to a user as "removed".
+ *
+ * A union rather than an optional field, so the two outcomes a user has to act
+ * on cannot be reported without saying why — an unexplained failure sends them
+ * to the backend with nothing to go on.
  */
-export interface RemoveOutcome {
-  status: "removed" | "unverified" | "failed";
-  /** Why, in one line. Shown verbatim; required for anything but "removed". */
-  detail?: string;
-}
+export type RemoveOutcome =
+  | { status: "removed" }
+  /** Accepted, but nothing available could confirm it. */
+  | { status: "unverified"; detail: string }
+  /** The tool errored, or the index is still listed afterwards. */
+  | { status: "failed"; detail: string };
 
 /** One index the backend holds, as it reports it. */
 export interface IndexedProject {

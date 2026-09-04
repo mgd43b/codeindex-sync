@@ -25,6 +25,13 @@ export interface McpToolResult {
   text: string;
 }
 
+/**
+ * Hard ceiling on a session when the config does not set one. Exported because
+ * callers that wait on a backend must bound themselves by the same number —
+ * two disagreeing deadlines is how a "hard ceiling" stops being one.
+ */
+export const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
+
 export interface McpClientOptions {
   /** Executable to spawn, e.g. "npx". */
   command: string;
@@ -100,7 +107,7 @@ export class McpSession {
     });
     child.stdout.on("data", (chunk: Buffer) => this.onData(chunk));
 
-    const timeoutMs = this.opts.timeoutMs ?? 60 * 60 * 1000;
+    const timeoutMs = this.opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.timer = setTimeout(() => {
       this.rejectAll(new McpError(`timed out after ${timeoutMs}ms`, "timeout"));
       this.close();
