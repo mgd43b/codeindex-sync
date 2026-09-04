@@ -54,6 +54,21 @@ export interface RepoStatus {
   lastIndexedAt?: string;
 }
 
+/**
+ * The result of trying to drop one index.
+ *
+ * Not a boolean, because there are three outcomes and conflating them is how a
+ * removal that did nothing gets reported as done: the backend can confirm the
+ * index is gone, it can leave it there while cheerfully acknowledging the call,
+ * or it can accept the call somewhere we have no way to check. Only the first
+ * may be shown to a user as "removed".
+ */
+export interface RemoveOutcome {
+  status: "removed" | "unverified" | "failed";
+  /** Why, in one line. Shown verbatim; required for anything but "removed". */
+  detail?: string;
+}
+
 /** One index the backend holds, as it reports it. */
 export interface IndexedProject {
   path: string;
@@ -83,8 +98,17 @@ export interface IndexProvider {
    * clear "unsupported" message rather than guessing.
    */
   projects?(): Promise<IndexedProject[] | null>;
-  /** Drop one index. Optional; `cleanup --apply` requires it. */
-  remove?(repoPath: string): Promise<boolean>;
+  /**
+   * Drop one index, and confirm it is actually gone.
+   *
+   * A tool reply is not evidence: a backend that cannot resolve the index — its
+   * directory is deleted by the time `cleanup` runs, by definition — may delete
+   * nothing and still answer without an error. Implementations must check the
+   * backend's own listing before reporting "removed".
+   *
+   * Optional; `cleanup --apply` requires it.
+   */
+  remove?(repoPath: string): Promise<RemoveOutcome>;
 
   index(req: IndexRequest): Promise<IndexOutcome>;
 

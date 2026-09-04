@@ -1022,22 +1022,51 @@ program
     }
     const registry = registryFrom(cfg);
     let removed = 0;
+    let unverified = 0;
     for (const orphan of orphans) {
       const provider = registry.all().find((p) => p.name === orphan.provider);
       if (!provider?.remove) {
         ui.bad(`${orphan.provider} cannot remove indexes`, "configure `tools.remove`");
         continue;
       }
-      if (await provider.remove(orphan.path)) {
+      const res = await provider.remove(orphan.path);
+      if (res.status === "removed") {
         ui.ok(`removed ${orphan.path}`);
         removed++;
+      } else if (res.status === "unverified") {
+        // Accepted, but nothing here proves it happened. Saying so beats a tick
+        // the next `cleanup` run contradicts.
+        ui.warn(`${orphan.path} — ${res.detail ?? "could not confirm removal"}`);
+        unverified++;
       } else {
-        ui.bad(`could not remove ${orphan.path}`);
+        const why = res.detail ? ` — ${res.detail}` : "";
+        ui.bad(`could not remove ${orphan.path}${why}`, removalRemedy(cfg, orphan.provider));
       }
     }
     ui.line();
-    ui.ok(`${removed} of ${orphans.length} removed`);
+    const tail = unverified > 0 ? `, ${unverified} unconfirmed` : "";
+    ui.ok(`${removed} of ${orphans.length} removed${tail}`);
   });
+
+/**
+ * What to try when a removal did not take.
+ *
+ * The usual cause is the one `cleanup` cannot avoid: the backend identifies an
+ * index by a marker *inside* the repository, and the repository is gone — that
+ * is the entire criterion for being an orphan. Recreating the directory with
+ * just that file is enough to let the backend resolve it again, so the remedy
+ * is built from the provider's own `detectFiles` rather than any knowledge of
+ * which backend is in use.
+ */
+function removalRemedy(cfg: Config, providerName: string): string {
+  const markers = cfg.providers.find((p) => p.name === providerName)?.detectFiles ?? [];
+  if (markers.length === 0) return "remove the index with the backend's own tooling";
+  return (
+    `the backend may need ${markers.map((m) => `\`${m}\``).join(" or ")} inside the repo ` +
+    `to resolve this index — recreate the directory with just that file and re-run, ` +
+    `or remove the index with the backend's own tooling`
+  );
+}
 
 // ── install-repo / uninstall-repo ──────────────────────────────────────────
 program

@@ -18,6 +18,7 @@ import type {
   IndexRequest,
   IndexedProject,
   ProviderHealth,
+  RemoveOutcome,
   RepoStatus,
 } from "../provider.js";
 
@@ -122,6 +123,20 @@ function safeCwd(wanted?: string): string {
     }
   }
   return tmpdir();
+}
+
+/**
+ * Are these the same index, as far as the backend's listing goes?
+ *
+ * Compared after normalisation because the path we were handed and the one the
+ * backend prints have travelled different routes — a trailing slash or an
+ * unresolved `..` would otherwise read as a different project and turn a real
+ * removal into a reported failure. Deliberately not resolved through the
+ * filesystem: these paths are deleted by definition, so there is nothing for
+ * `realpath` to work with.
+ */
+function samePath(a: string, b: string): boolean {
+  return path.normalize(a).replace(/\/+$/, "") === path.normalize(b).replace(/\/+$/, "");
 }
 
 const DEFAULT_BUSY_MARKERS = ["another indexer", "already in progress", "locked by", "BUSY"];
@@ -268,16 +283,61 @@ export class McpIndexProvider implements IndexProvider {
     }
   }
 
-  /** Drop one index. Returns false when the backend cannot do this. */
-  async remove(repoPath: string): Promise<boolean> {
+  /**
+   * Drop one index, then check the backend's own listing to see whether it
+   * actually went.
+   *
+   * The reply cannot be trusted here, and the reason is structural rather than
+   * a quirk of any one backend. `cleanup`'s entire input is paths whose
+   * directory is gone, and a backend that identifies an index by something
+   * stored *inside* the repository cannot resolve it once that is deleted — so
+   * it removes nothing, finds nothing to complain about, and answers without an
+   * error. Believing that is how `cleanup --apply` printed "removed" while the
+   * index stayed put, forever re-listing as an orphan.
+   *
+   * Unlike an async index call, verification does not need to share a session:
+   * a project listing is durable backend state rather than per-process
+   * progress, so asking again in a fresh child is not merely adequate but
+   * stricter — it proves the removal is visible to the *next* process, which is
+   * exactly what the next `cleanup` run will be.
+   */
+  async remove(repoPath: string): Promise<RemoveOutcome> {
     const tool = this.cfg.tools.remove;
-    if (!tool) return false;
-    try {
-      const res = await this.call(repoPath, tool, this.repoArgs(repoPath));
-      return !res.isError;
-    } catch {
-      return false;
+    if (!tool) {
+      return { status: "failed", detail: "no `tools.remove` configured for this provider" };
     }
+
+    let res: McpToolResult;
+    try {
+      res = await this.call(repoPath, tool, this.repoArgs(repoPath));
+    } catch (err) {
+      return { status: "failed", detail: err instanceof Error ? err.message : String(err) };
+    }
+    if (res.isError) {
+      return { status: "failed", detail: firstMeaningfulLine(res.text) || res.text };
+    }
+
+    // No way to look: say so rather than passing the reply off as proof.
+    if (!this.cfg.tools.list) {
+      return {
+        status: "unverified",
+        detail: `${tool} reported success; no \`tools.list\` configured to confirm it`,
+      };
+    }
+    const after = await this.projects();
+    if (after === null) {
+      return {
+        status: "unverified",
+        detail: `${tool} reported success, but ${this.cfg.tools.list} could not be read to confirm it`,
+      };
+    }
+    if (after.some((p) => samePath(p.path, repoPath))) {
+      return {
+        status: "failed",
+        detail: `${tool} reported success but the backend still lists this index`,
+      };
+    }
+    return { status: "removed" };
   }
 
   async health(): Promise<ProviderHealth[]> {
