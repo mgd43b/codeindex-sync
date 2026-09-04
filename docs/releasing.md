@@ -78,12 +78,26 @@ publish above:
 ```
 
 That resolves the tarball URL from the registry, hashes the actual bytes (npm
-publishes sha512 integrity; Homebrew wants sha256), and writes
-`Formula/codeindex-sync.rb` into the tap. Commit and push the tap, then:
+publishes sha512 integrity; Homebrew wants sha256), renders the formula from
+`packaging/homebrew/codeindex-sync.rb`, commits and pushes it to the tap, then
+installs it to prove it builds. Re-running once the formula already matches is a
+no-op, so it is safe after any release.
 
-```bash
-brew install mgd43b/taps/codeindex-sync
-```
+`--dry-run` shows the diff and changes nothing; `--skip-test` pushes without the
+install check; a version argument publishes something other than `latest`.
+
+**`brew` does not read your working clone of the tap.** It reads its own, under
+`$(brew --prefix)/Library/Taps/…`, which contains only what has been pushed and
+fetched — so a formula written locally and left uncommitted is both correct and
+invisible, and `brew install` answers "No available formula" without mentioning
+the tap or the missing push. The script fast-forwards brew's clone after
+pushing, which is what keeps those two in agreement.
+
+One trap it checks for rather than letting Homebrew report obliquely: anything
+already occupying `$(brew --prefix)/bin/codeindex-sync` — a global npm install
+or `npm link`, say — makes brew refuse to link, and the error talks about
+symlinks rather than about what put one there. Remove it first
+(`npm rm -g codeindex-sync`).
 
 ## Subsequent releases
 
