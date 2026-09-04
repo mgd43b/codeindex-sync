@@ -73,17 +73,29 @@ things ("in the background", "in progress"):
 | --- | --- | --- |
 | `asyncIndexMarkers` | `in the background`, `running asynchronously`, `check progress` | A reply meaning "started", not "done" |
 | `progressMarkers` | `in progress`, `in-progress`, `actively indexing` | A `status` reply meaning work is still running |
-| `pollIntervalMs` | `2000` | Gap between status polls |
+| `pollIntervalMs` | `2000` | Cadence the status polls settle at (must be positive) |
 
-Two consequences worth knowing. An incremental `update` that answers
-synchronously is *not* polled — hooks fire constantly and that reply is already
-the truth — but one whose reply matches `asyncIndexMarkers` is. And if the
-backend still calls its own index incomplete once the work stops, that is a
-failure, not a success with a small number in it.
+Polling starts immediately and backs off to `pollIntervalMs`, so a tool that
+already did the work before replying pays one extra call and no waiting, while a
+long job is not polled hard. Cheap early polls also matter for correctness: a run
+that starts and finishes between two polls was never *seen*, and an unseen run
+cannot be told apart from one that never started.
 
-The wait is bounded by `timeoutMs`, the caller's abort signal, and the session's
-own hard timer. Running out of time is reported as a failure: a backend that
-never finishes must never look like one that did.
+Three consequences worth knowing:
+
+- An incremental `update` that answers synchronously is not polled — hooks fire
+  constantly and that reply is already the truth — but one whose reply matches
+  `asyncIndexMarkers` is.
+- "Done" is not merely "no progress marker". Re-indexing a repo that already has
+  an index reports a perfectly healthy one during the window before the new run
+  becomes visible, so a reply that announced background work must be watched
+  running before it counts as finished.
+- A run that stops having produced no index at all, or one the backend still
+  calls incomplete, is a failure — not a success with a small number in it.
+
+The wait is bounded by the caller's abort signal and by the session's own hard
+timer, which kills the child and makes every later call fail at once. Both end as
+a failure: a backend that never finishes must never look like one that did.
 
 **`env` exists because git hooks are not a login shell.** They never source
 `~/.bashrc`, `~/.zshenv` or any profile, so anything you export in a shell is

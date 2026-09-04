@@ -64,6 +64,17 @@ const COMPLETED = [
   "  Files: 12, Chunks: 40",
 ].join("\n");
 
+/** A healthy index left behind by an EARLIER run, before this one starts. */
+const PREVIOUS = [
+  "Project: /repo",
+  "Collection: codebase_stub",
+  "Status: green",
+  "Indexed chunks: 5",
+  "",
+  "Last operation: Full index — completed",
+  "  Files: 3, Chunks: 5",
+].join("\n");
+
 /** What a backend says when it has never heard of the project. */
 const NO_INDEX = "No index found for project: /repo\nRun index to create one.";
 
@@ -76,6 +87,8 @@ interface StubOptions {
   finalStatus?: string | null;
   /** Whether the index/update tool kicks off background work at all. */
   background?: boolean;
+  /** Status before the run becomes visible. Defaults to "never heard of it". */
+  idleStatus?: string;
 }
 
 /**
@@ -91,10 +104,10 @@ function stubServer(opts: StubOptions = {}): string {
     updateReply: opts.updateReply ?? "Added: 3\nNew chunks: 135",
     finalStatus: opts.finalStatus === undefined ? COMPLETED : opts.finalStatus,
     background: opts.background ?? true,
+    idleStatus: opts.idleStatus ?? NO_INDEX,
     startupMs: STARTUP_MS,
     indexMs: INDEX_MS,
     inProgress: IN_PROGRESS,
-    noIndex: NO_INDEX,
   });
   writeFileSync(
     file,
@@ -120,7 +133,7 @@ function begin() {
 function statusText() {
   if (phase === "running") return cfg.inProgress;
   if (phase === "done") return cfg.finalStatus;
-  return cfg.noIndex;
+  return cfg.idleStatus;
 }
 
 let buf = "";
@@ -254,6 +267,63 @@ describe("a fire-and-forget index tool", () => {
     const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
     expect(got.status).toBe("failed");
     expect(got.error).toMatch(/incomplete/i);
+  });
+
+  it("keeps waiting when a previous run already left a healthy index", async () => {
+    // The trap in "done means no progress marker": a re-index of a populated
+    // repo reports a perfectly good index during the window before the new run
+    // becomes visible. Believing it returns the OLD count and reaps the child
+    // mid-run — the original bug, wearing a healthy-looking status.
+    const p = providerFor(stubServer({ idleStatus: PREVIOUS, finalStatus: COMPLETED }));
+    const t0 = Date.now();
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+
+    expect(got.status).toBe("ok");
+    expect(got.chunks).toBe(40); // the new run, not the previous 5
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(STARTUP_MS + INDEX_MS);
+  });
+
+  it("fails when the backend reports no index after being told to build one", async () => {
+    // Ran, finished, produced nothing. That is the symptom this whole change
+    // exists to stop reporting as a success.
+    const p = providerFor(stubServer({ finalStatus: NO_INDEX }));
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+    expect(got.status).toBe("failed");
+    expect(got.error).toMatch(/no index/i);
+  });
+
+  it("returns as soon as the run is done, without sitting out the settle window", async () => {
+    // A short run must not be billed for the grace period that exists only to
+    // catch a backend which has not started reporting yet.
+    const p = providerFor(stubServer(), { pollIntervalMs: 2_000 });
+    const t0 = Date.now();
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+    const elapsed = Date.now() - t0;
+
+    expect(got.status).toBe("ok");
+    expect(got.chunks).toBe(40);
+    // The settle window here is 2s * 8 = 16s; the run itself takes 350ms.
+    expect(elapsed).toBeLessThan(8_000);
+  });
+
+  it("adds no fixed delay when the index tool answered synchronously", async () => {
+    // A tool that did the work before replying has nothing to wait for. One
+    // immediate status call to pick up the counters, then done — sleeping a
+    // poll interval first would tax every --full for nothing.
+    const p = providerFor(
+      stubServer({
+        indexReply: "Rebuilt index for /repo\nFiles: 12, Chunks: 40",
+        background: false,
+        idleStatus: COMPLETED,
+      }),
+      { pollIntervalMs: 5_000 },
+    );
+    const t0 = Date.now();
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+
+    expect(got.status).toBe("ok");
+    expect(got.chunks).toBe(40);
+    expect(Date.now() - t0).toBeLessThan(3_000);
   });
 
   it("treats a busy reply as busy without waiting on it", async () => {

@@ -72,6 +72,37 @@ describe("parseConfig", () => {
     }
   });
 
+  it.each([
+    ["zero", 0],
+    ["negative", -1],
+    ["not a number", "2000"],
+    ["NaN", Number.NaN],
+  ])("rejects a %s pollIntervalMs rather than spinning on it later", (_label, value) => {
+    // A non-positive interval turns the status poll into a spin loop against
+    // the backend; this file's job is to catch that at load, not at 2am.
+    try {
+      parseConfig(
+        JSON.stringify({
+          providers: [{ name: "x", command: "y", tools: { update: "u" }, pollIntervalMs: value }],
+        }),
+      );
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).message).toContain("pollIntervalMs");
+      expect((err as ConfigError).remedy).toContain("2000");
+    }
+  });
+
+  it("accepts a positive pollIntervalMs", () => {
+    const cfg = parseConfig(
+      JSON.stringify({
+        providers: [{ name: "x", command: "y", tools: { update: "u" }, pollIntervalMs: 500 }],
+      }),
+    );
+    expect(cfg.providers[0]?.pollIntervalMs).toBe(500);
+  });
+
   it("keeps optional fields when present", () => {
     const cfg = parseConfig(
       JSON.stringify({

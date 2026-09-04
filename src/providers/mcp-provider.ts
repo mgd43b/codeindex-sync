@@ -179,20 +179,41 @@ const DEFAULT_PROGRESS_MARKERS = ["in progress", "in-progress", "actively indexi
 const DEFAULT_POLL_INTERVAL_MS = 2_000;
 
 /**
- * How long to keep polling for progress that has not appeared yet, as a
- * multiple of the poll interval.
+ * Grace period for progress that has not appeared yet, as a multiple of the
+ * poll interval.
  *
  * There is a gap between an async tool returning and its progress state
  * becoming visible — it typically takes a lock first. Polling once and
- * believing the answer would race straight back into the bug, so a reply that
- * announced background work is given this long to show something before we
- * accept "nothing is running" at face value.
+ * believing the answer would race straight back into the bug, so the backend
+ * is given this long to show something before "nothing is running" is taken at
+ * face value.
  */
-const SETTLE_POLLS = 8;
+const SETTLE_INTERVALS = 8;
+
+/**
+ * Floor for the first few polls.
+ *
+ * Waiting a full interval before looking would both add fixed latency to a
+ * synchronous tool and let a *fast* async run start and finish unseen — and an
+ * unseen run cannot be told apart from one that never started. Polls therefore
+ * begin immediately and back off to the configured cadence, which is cheap
+ * where it matters and unobtrusive once the job is clearly long-running.
+ */
+const MIN_POLL_MS = 100;
 
 function matchesAny(text: string, markers: readonly string[]): boolean {
   const hay = text.toLowerCase();
   return markers.some((m) => hay.includes(m.toLowerCase()));
+}
+
+/**
+ * Does this reply describe an index that exists?
+ *
+ * The same notion `status()` reports as `indexed`, kept in one place so the
+ * two cannot drift: what `list` calls indexed is what counts as done here.
+ */
+function looksIndexed(text: string): boolean {
+  return /indexed|chunks/i.test(text);
 }
 
 /** Sleep that gives up early when the caller aborts. */
@@ -317,14 +338,20 @@ export class McpIndexProvider implements IndexProvider {
    *
    * Polling is skipped for a synchronous `update`, which is the hot path: hooks
    * fire constantly and that reply is already the truth. It is NOT skipped for
-   * a synchronous index tool — one extra call costs nothing on a full reindex
-   * and upgrades the summary from "started" to real counters.
+   * a synchronous index tool — one immediate call costs nothing on a full
+   * reindex and upgrades the summary from "started" to real counters.
    *
-   * The loop is bounded three ways, because a wait is the one thing here that
-   * could wedge the queue: the caller's abort signal, an explicit deadline of
-   * the configured timeout, and — underneath both — the session's own hard
-   * timer, which kills the child and makes every later call fail immediately.
-   * Any of the three ends as a failure, never as a silent success.
+   * "Done" is deliberately not "no progress marker": a re-index of an already
+   * populated repo reports a perfectly healthy index during the window before
+   * the new run becomes visible, and believing that is the original bug. So a
+   * reply that announced background work must be watched running before it can
+   * be called finished; only a reply that promised nothing may be confirmed
+   * straight from an index that already exists.
+   *
+   * The wait is bounded by the caller's abort signal and by the session's own
+   * hard timer, which kills the child and makes every later call fail at once.
+   * Both end as a failure — a backend that never finishes must never look like
+   * one that did.
    */
   private async awaitCompletion(
     session: McpSession,
@@ -345,48 +372,53 @@ export class McpIndexProvider implements IndexProvider {
 
     const progressMarkers = this.cfg.progressMarkers ?? DEFAULT_PROGRESS_MARKERS;
     const interval = this.cfg.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-    const timeoutMs = this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-    const deadline = Date.now() + timeoutMs;
-    const settleUntil = Date.now() + interval * SETTLE_POLLS;
+    // Never sleep past the session's own ceiling: a long poll interval must not
+    // outlive the child it is waiting on.
+    const deadline = Date.now() + (this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    const settleUntil = Date.now() + interval * SETTLE_INTERVALS;
+
+    /** Accept a settled reply, unless the backend disowns its own index. */
+    const finish = (res: McpToolResult): McpToolResult =>
+      /incomplete/i.test(res.text)
+        ? // Still incomplete after the work stopped: not a success with a small
+          // number in it. Failing loudly beats an empty index that reads healthy.
+          { isError: true, text: `index still incomplete after ${statusTool}\n${res.text}` }
+        : res;
+
     let sawProgress = false;
+    let backoff = Math.min(MIN_POLL_MS, interval);
 
     for (;;) {
-      // Sleep first: an async tool returns before its progress state is
-      // visible, so an immediate poll can see a backend that looks idle.
-      // Then check the guards, so neither an abort nor the deadline can be
-      // followed by one more call into a backend that may never answer.
-      await sleep(interval, req.signal);
-      if (req.signal?.aborted) {
-        return { isError: true, text: "aborted while waiting for the backend to finish" };
-      }
-      if (Date.now() >= deadline) {
-        return {
-          isError: true,
-          text:
-            `backend still had work outstanding after ${Math.round(timeoutMs / 1000)}s; ` +
-            `giving up rather than reporting an unfinished index as done`,
-        };
-      }
-
       const now = await session.callTool(statusTool, this.repoArgs(req.repoPath));
       // The session died or timed out. Reporting that is the whole point.
       if (now.isError) return now;
 
-      if (matchesAny(now.text, progressMarkers)) {
-        sawProgress = true;
-        continue;
-      }
-      // Idle. Believe it once we have watched the work run, or once a reply
-      // that promised background work has had its settle window to show it.
-      if (!sawProgress && asyncReply && Date.now() < settleUntil) continue;
+      const running = matchesAny(now.text, progressMarkers);
+      if (running) sawProgress = true;
 
-      // A backend that still calls its own index incomplete has not succeeded,
-      // whatever the tool call said. Failing loudly beats an empty index that
-      // reports as healthy.
-      if (/incomplete/i.test(now.text)) {
-        return { isError: true, text: `index still incomplete after ${statusTool}\n${now.text}` };
+      if (!running && (sawProgress || !asyncReply) && looksIndexed(now.text)) {
+        return finish(now);
       }
-      return now;
+
+      // Never saw the work start. Believe an index that exists — a very fast
+      // run can finish between polls — but a backend that reports none after
+      // being told to build one has failed, however cheerful its reply was.
+      if (!running && Date.now() >= settleUntil) {
+        return looksIndexed(now.text)
+          ? finish(now)
+          : {
+              isError: true,
+              text: `${statusTool} still reports no index after running ${
+                usedIndexTool ? (this.cfg.tools.index ?? "index") : this.cfg.tools.update
+              }`,
+            };
+      }
+
+      await sleep(Math.min(backoff, Math.max(0, deadline - Date.now())), req.signal);
+      if (req.signal?.aborted) {
+        return { isError: true, text: "aborted while waiting for the backend to finish" };
+      }
+      backoff = Math.min(backoff * 2, interval);
     }
   }
 
@@ -397,7 +429,7 @@ export class McpIndexProvider implements IndexProvider {
       const res = await this.call(repoPath, tool, this.repoArgs(repoPath));
       if (res.isError) return null;
       const status: RepoStatus = {
-        indexed: /indexed|chunks/i.test(res.text),
+        indexed: looksIndexed(res.text),
         incomplete: /incomplete/i.test(res.text),
       };
       const files = extractNumber(res.text, "Files", "filesIndexed");

@@ -101,7 +101,19 @@ function validateProvider(p: unknown, index: number): McpProviderConfig {
     cfg.asyncIndexMarkers = o["asyncIndexMarkers"] as string[];
   }
   if (Array.isArray(o["progressMarkers"])) cfg.progressMarkers = o["progressMarkers"] as string[];
-  if (typeof o["pollIntervalMs"] === "number") cfg.pollIntervalMs = o["pollIntervalMs"];
+  if (o["pollIntervalMs"] !== undefined) {
+    // A zero, negative or NaN interval turns the status poll into a spin loop
+    // that hammers the backend. Rejecting it here beats discovering it as a
+    // pegged CPU during someone's first full reindex.
+    const ms = o["pollIntervalMs"];
+    if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
+      throw new ConfigError(
+        `${where}.pollIntervalMs must be a positive number of milliseconds`,
+        `use a value like 2000, or remove "pollIntervalMs" from ${where} to take the default`,
+      );
+    }
+    cfg.pollIntervalMs = ms;
+  }
   if (typeof o["timeoutMs"] === "number") cfg.timeoutMs = o["timeoutMs"];
   if (typeof o["env"] === "object" && o["env"] !== null) {
     cfg.env = o["env"] as Record<string, string>;
