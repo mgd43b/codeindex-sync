@@ -60,6 +60,7 @@ behaviour here comes from a failure seen in production:
 | `worktrees [--prune\|--gone]` | Inspect worktrees; drop dangling registrations or merged ones |
 | `cleanup [--apply]` | Remove indexes whose directory is gone (dry run by default) |
 | `schedule` / `unschedule` | Drain the queue on a timer (launchd or systemd) |
+| `claim [repo] [--replace]` / `unclaim [--remove]` | Opt a repo in or out by writing the provider's marker file |
 | `install-repo` / `uninstall-repo` | Cover a repo that sets its own `core.hooksPath` |
 | `completion [shell]` | Shell completion for bash, zsh or fish |
 | `hook <name>` | Entry point for git hooks (enqueues; never indexes inline) |

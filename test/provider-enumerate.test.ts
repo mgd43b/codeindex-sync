@@ -260,6 +260,29 @@ describe("parseProjectListing", () => {
     ]);
   });
 
+  it("does not let a pathless record steal the previous project's details", () => {
+    // A backend can list an index whose path it no longer knows. Its details
+    // are not the previous project's — treating them as such reported the
+    // wrong collection for a real repo in `list --all`.
+    const got = parseProjectListing(
+      [
+        "  - /home/me/alpha",
+        "    Collection: codebase_alpha",
+        "    Files: 11",
+        "  - (path unknown — indexed before path tracking)",
+        "    Collection: codebase_7857c8abdc96",
+        "    Code graph: not built",
+        "  - /home/me/beta",
+        "    Collection: codebase_beta",
+      ].join("\n"),
+    );
+    expect(got.map((g) => [g.path, g.collection])).toEqual([
+      ["/home/me/alpha", "codebase_alpha"],
+      ["/home/me/beta", "codebase_beta"],
+    ]);
+    expect(got[0]?.files).toBe("11");
+  });
+
   it("returns nothing for output with no paths", () => {
     expect(parseProjectListing("No projects have been indexed.")).toEqual([]);
   });

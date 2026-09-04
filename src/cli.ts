@@ -12,7 +12,16 @@
  *  4. A user never sees a stack trace.
  */
 import { Command } from "commander";
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import { ConfigError, configPath, loadConfig, saveConfig, type Config } from "./config.js";
@@ -40,7 +49,7 @@ import {
 } from "./install.js";
 import { WorkerLock } from "./lock.js";
 import { Logger } from "./logger.js";
-import { resolvePaths } from "./paths.js";
+import { isUnder, resolvePaths } from "./paths.js";
 import { PRESETS, findPreset } from "./presets.js";
 import {
   DEFAULT_INTERVAL,
@@ -51,7 +60,7 @@ import {
   scheduleInstalled,
 } from "./schedule.js";
 import { ProviderRegistry } from "./provider.js";
-import { McpIndexProvider } from "./providers/mcp-provider.js";
+import { McpIndexProvider, type McpProviderConfig } from "./providers/mcp-provider.js";
 import { Queue, nowIso } from "./queue.js";
 import * as ui from "./ui.js";
 import { buildHookRegistry } from "./runtime.js";
@@ -109,16 +118,59 @@ function requireProviders(cfg: Config): void {
   }
 }
 
+/**
+ * Help groups, in the order `--help` shows them.
+ *
+ * Commander orders groups by the order their commands happen to be registered,
+ * which makes the sequence an accident of file layout and quietly reshuffles it
+ * the moment someone adds a command at the top. Declaring the order here keeps
+ * `--help` answering "what do I run next?" instead of listing twenty commands
+ * in registration order.
+ */
+const GROUP = {
+  everyday: "Everyday:",
+  setup: "Setup:",
+  scheduling: "Scheduling:",
+  queue: "Queue:",
+  diagnostics: "Diagnostics:",
+  internal: "Internal:",
+} as const;
+
+const GROUP_ORDER: readonly string[] = [
+  GROUP.everyday,
+  GROUP.setup,
+  GROUP.scheduling,
+  GROUP.queue,
+  GROUP.diagnostics,
+  GROUP.internal,
+];
+
 const program = new Command();
 program
   .name("codeindex-sync")
   .description("Keep code indexes in sync with git activity, for any MCP backend")
-  .version(VERSION);
+  .version(VERSION)
+  .configureHelp({
+    groupItems<T>(unsorted: T[], visible: T[], getGroup: (item: T) => string): Map<string, T[]> {
+      const out = new Map<string, T[]>(GROUP_ORDER.map((heading) => [heading, []]));
+      // Anything not covered above keeps commander's own order of appearance.
+      for (const item of [...unsorted, ...visible]) {
+        const group = getGroup(item);
+        if (!out.has(group)) out.set(group, []);
+      }
+      for (const item of visible) out.get(getGroup(item))?.push(item);
+      // This hook groups options too, and those use none of the headings above,
+      // so drop any that ended up empty rather than printing a bare heading.
+      for (const [heading, items] of out) if (items.length === 0) out.delete(heading);
+      return out;
+    },
+  });
 
 // ── init ──────────────────────────────────────────────────────────────────
 program
   .command("init")
   .description("Create a config file from a preset")
+  .helpGroup(GROUP.setup)
   .option("--preset <id>", "preset to use")
   .option("--force", "overwrite an existing config", false)
   .action((opts: { preset?: string; force: boolean }) => {
@@ -154,6 +206,7 @@ program
 program
   .command("doctor")
   .description("Diagnose configuration, hooks and backend health")
+  .helpGroup(GROUP.diagnostics)
   .action(async () => {
     const cfg = config();
     const paths = resolvePaths();
@@ -263,6 +316,7 @@ program
 program
   .command("status")
   .description("Show the queue, worker and recent failures")
+  .helpGroup(GROUP.everyday)
   .action(() => {
     const cfg = config();
     const paths = resolvePaths();
@@ -302,6 +356,7 @@ program
 program
   .command("list [repo]")
   .description("Show what each provider knows about a repository")
+  .helpGroup(GROUP.everyday)
   .option("--all", "every index the backend holds, not just this repo", false)
   .option("--stale", "with --all, only rows needing attention", false)
   .option("--json", "machine-readable output", false)
@@ -365,6 +420,7 @@ program
 program
   .command("log [lines]")
   .description("Show the worker log")
+  .helpGroup(GROUP.everyday)
   .option("-f, --follow", "keep printing as the worker writes", false)
   .action((lines: string | undefined, opts: { follow: boolean }) => {
     const file = resolvePaths().log;
@@ -412,6 +468,7 @@ program
 program
   .command("sync [repo]")
   .description("Index a repository now")
+  .helpGroup(GROUP.everyday)
   .option("--full", "force a complete reindex", false)
   .action(async (repo: string | undefined, opts: { full: boolean }) => {
     const cfg = config();
@@ -445,6 +502,7 @@ program
 program
   .command("drain")
   .description("Process the queue until it is empty")
+  .helpGroup(GROUP.queue)
   .action(async () => {
     const cfg = config();
     requireProviders(cfg);
@@ -478,6 +536,7 @@ program
 program
   .command("once")
   .description("Process a single queued job")
+  .helpGroup(GROUP.queue)
   .action(async () => {
     const cfg = config();
     requireProviders(cfg);
@@ -489,6 +548,7 @@ program
 program
   .command("retry [match]")
   .description("Requeue failed jobs")
+  .helpGroup(GROUP.queue)
   .action((match: string | undefined) => {
     const n = workerFrom(config()).retryFailed(match);
     if (n) ui.ok(`requeued ${n} job(s)`);
@@ -498,6 +558,7 @@ program
 program
   .command("forget <match>")
   .description("Drop failed jobs without retrying (use --all for everything)")
+  .helpGroup(GROUP.queue)
   .action((match: string) => {
     const n = workerFrom(config()).forgetFailed(match);
     if (n) ui.ok(`dropped ${n} job(s)`);
@@ -507,6 +568,7 @@ program
 program
   .command("unlock")
   .description("Release the worker lock")
+  .helpGroup(GROUP.queue)
   .option("--force", "break the lock even if the holder is alive", false)
   .action((opts: { force: boolean }) => {
     const r = new WorkerLock(resolvePaths().lock).forceRelease(opts.force);
@@ -523,6 +585,7 @@ program
 program
   .command("providers")
   .description("List configured providers and available presets")
+  .helpGroup(GROUP.diagnostics)
   .option("--example", "print an example provider block", false)
   .action((opts: { example: boolean }) => {
     if (opts.example) {
@@ -544,6 +607,7 @@ program
 program
   .command("extensions")
   .description("List registered git-hook handlers")
+  .helpGroup(GROUP.diagnostics)
   .action(() => {
     // Indexing is only the first subscriber; third-party handlers register here.
     const all = buildHookRegistry(config()).all();
@@ -557,6 +621,7 @@ program
 program
   .command("worktrees [repo]")
   .description("Show worktrees and prune dangling registrations")
+  .helpGroup(GROUP.diagnostics)
   .option("--prune", "remove registrations whose directory is gone", false)
   .option("--gone", "remove worktrees whose upstream branch was deleted", false)
   .option("--apply", "with --gone, actually remove them (default: dry run)", false)
@@ -596,6 +661,7 @@ program
 program
   .command("install")
   .description("Install the git hook dispatcher globally")
+  .helpGroup(GROUP.setup)
   .option("--hooks-dir <dir>", "where to install", defaultHooksDir())
   .option("--yes", "skip the confirmation prompt", false)
   .action((opts: { hooksDir: string; yes: boolean }) => {
@@ -631,6 +697,7 @@ program
 program
   .command("uninstall")
   .description("Remove the global git hooks setting")
+  .helpGroup(GROUP.setup)
   .action(() => {
     const existing = globalHooksPath();
     if (!existing) {
@@ -933,6 +1000,7 @@ ${commands
 program
   .command("completion [shell]")
   .description("Print a shell completion script (bash, zsh or fish)")
+  .helpGroup(GROUP.setup)
   .action((shell: string | undefined) => {
     const target = (shell ?? process.env["SHELL"]?.split("/").pop() ?? "bash").toLowerCase();
     if (!["bash", "zsh", "fish"].includes(target)) {
@@ -949,6 +1017,7 @@ program
 program
   .command("schedule")
   .description("Drain the queue automatically on a timer (launchd or systemd)")
+  .helpGroup(GROUP.scheduling)
   .option("--interval <seconds>", "how often to drain", String(DEFAULT_INTERVAL))
   .action((opts: { interval: string }) => {
     const interval = Number.parseInt(opts.interval, 10);
@@ -985,6 +1054,7 @@ program
 program
   .command("unschedule")
   .description("Stop draining on a timer")
+  .helpGroup(GROUP.scheduling)
   .action(() => {
     const res = removeSchedule();
     if (res.removed.length === 0) {
@@ -998,6 +1068,7 @@ program
 program
   .command("cleanup")
   .description("Remove indexes whose directory no longer exists (dry run by default)")
+  .helpGroup(GROUP.diagnostics)
   .option("--apply", "actually remove them", false)
   .action(async (opts: { apply: boolean }) => {
     const cfg = config();
@@ -1070,10 +1141,193 @@ function removalRemedy(cfg: Config, providerName: string): string {
   );
 }
 
+// ── claim / unclaim ───────────────────────────────────────────────────────
+/**
+ * Which configured provider should claim a repo that nothing claims yet.
+ *
+ * Only meaningful when the repo is unclaimed, so `--provider` is required as
+ * soon as there is a real choice — guessing would write the wrong backend's
+ * marker into someone's repository.
+ */
+function providerToClaimWith(cfg: Config, wanted?: string): McpProviderConfig {
+  if (wanted) {
+    const found = cfg.providers.find((p) => p.name === wanted);
+    if (!found) {
+      ui.fail(
+        `no configured provider named ${wanted}`,
+        `configured: ${cfg.providers.map((p) => p.name).join(", ")}`,
+      );
+    }
+    return found;
+  }
+  if (cfg.providers.length > 1) {
+    ui.fail(
+      "several providers are configured, so which one should claim this repo is ambiguous",
+      `pass --provider <${cfg.providers.map((p) => p.name).join("|")}>`,
+    );
+  }
+  return cfg.providers[0] as McpProviderConfig;
+}
+
+/** The index a backend already holds for this exact path, if any. */
+async function indexAt(registry: ProviderRegistry, name: string, repoPath: string) {
+  const provider = registry.get(name);
+  if (!provider?.projects) return undefined;
+  const projects = await provider.projects();
+  const resolved = path.resolve(repoPath);
+  return projects?.find((entry) => path.resolve(entry.path) === resolved);
+}
+
+program
+  .command("claim [repo]")
+  .description("Opt a repository in to a provider by writing its marker file")
+  .helpGroup(GROUP.setup)
+  .option("--provider <name>", "which provider claims it (when several are configured)")
+  .option("--id <id>", "project id to pin (default: the repository's directory name)")
+  .option("--replace", "drop any index the backend already holds for this path", false)
+  .action(async (repo: string | undefined, opts: { provider?: string; id?: string; replace: boolean }) => {
+    const cfg = config();
+    requireProviders(cfg);
+    const target = resolveRepo(repo ?? process.cwd());
+
+    // A global hooksPath fires everywhere; anything outside root is ignored by
+    // design, so claiming it would produce a marker that never does anything.
+    if (!isUnder(target, cfg.root)) {
+      ui.fail(
+        `${target} is outside the configured root (${cfg.root})`,
+        "move the repo under root, or change `root` in the config",
+      );
+    }
+
+    const registry = registryFrom(cfg);
+    const already = await registry.resolve(target);
+    if (already) {
+      ui.heading(path.basename(target));
+      ui.info(`already claimed by ${already.name}`);
+      return;
+    }
+
+    const pcfg = providerToClaimWith(cfg, opts.provider);
+    const markerFile = pcfg.detectFiles?.[0];
+    if (!markerFile) {
+      ui.fail(
+        `${pcfg.name} claims repositories without a marker file`,
+        "it has no `detectFiles`, so there is nothing to write",
+      );
+    }
+    if (pcfg.markerContent === undefined) {
+      // Configs written before this field existed have no marker template, and
+      // there is no backend-agnostic default to invent. Point at the preset's
+      // own value rather than guessing on the user's behalf — presets are the
+      // shipped description of a backend, but the config is what is in force.
+      const shipped = PRESETS.find(
+        (preset) => preset.config.name === pcfg.name && preset.config.markerContent !== undefined,
+      )?.config.markerContent;
+      ui.fail(
+        `${pcfg.name} does not describe what its marker file should contain`,
+        shipped
+          ? `add this to the provider in ${configPath()}: "markerContent": ${JSON.stringify(shipped)}`
+          : `add "markerContent" to the provider, or create ${markerFile} yourself`,
+      );
+    }
+    const dest = path.join(target, markerFile);
+    if (existsSync(dest)) {
+      ui.fail(`${markerFile} already exists in ${target}`, "remove it first if you meant to replace it");
+    }
+
+    // An index the backend already holds under a path-derived name is about to
+    // be stranded: pinning an id moves the collection, and `cleanup` only ever
+    // reclaims indexes whose DIRECTORY is gone — this one's is not.
+    const existing = await indexAt(registry, pcfg.name, target);
+    if (existing && !opts.replace) {
+      ui.fail(
+        `${pcfg.name} already holds an index for this path${existing.collection ? ` (${existing.collection})` : ""}`,
+        "pinning an id may move it to a new collection and leave that one unreachable — re-run with --replace to drop it first",
+      );
+    }
+
+    ui.heading(`Claiming ${path.basename(target)} for ${pcfg.name}`);
+    if (existing && opts.replace) {
+      const provider = registry.get(pcfg.name);
+      if (!provider?.remove) {
+        ui.fail(`${pcfg.name} cannot remove indexes`, "configure `tools.remove`, or drop it by hand");
+      }
+      const res = await provider.remove(target);
+      if (res.status === "removed") ui.ok(`dropped the existing index${existing.collection ? ` (${existing.collection})` : ""}`);
+      else if (res.status === "unverified") ui.warn(`${res.detail} — continuing`);
+      else {
+        ui.fail(`could not drop the existing index — ${res.detail}`, "resolve that first; claiming now would strand it");
+      }
+    }
+
+    const id = opts.id ?? path.basename(target);
+    writeFileSync(dest, pcfg.markerContent.replaceAll("${name}", id), "utf8");
+    ui.ok(`wrote ${markerFile} (id: ${id})`);
+    ui.line();
+    ui.line(`  ${ui.style.dim("next:")} ${ui.style.cyan(`codeindex-sync sync ${target} --full`)}`);
+  });
+
+program
+  .command("unclaim [repo]")
+  .description("Opt a repository out by removing its marker file")
+  .helpGroup(GROUP.setup)
+  .option("--remove", "also drop the index the backend holds for it", false)
+  .action(async (repo: string | undefined, opts: { remove: boolean }) => {
+    const cfg = config();
+    requireProviders(cfg);
+    const target = resolveRepo(repo ?? process.cwd());
+    const registry = registryFrom(cfg);
+
+    const provider = await registry.resolve(target);
+    if (!provider) {
+      ui.heading(path.basename(target));
+      ui.info("no configured provider claims this repo");
+      return;
+    }
+    const pcfg = cfg.providers.find((p) => p.name === provider.name);
+    const markerFile = pcfg?.detectFiles?.[0];
+    if (!markerFile) {
+      ui.fail(
+        `${provider.name} claims every repo, not just marked ones`,
+        "there is no marker to remove; drop the provider from your config instead",
+      );
+    }
+    const dest = path.join(target, markerFile);
+    if (!existsSync(dest)) {
+      ui.fail(`${markerFile} is not present in ${target}`, "nothing to remove");
+    }
+
+    ui.heading(`Unclaiming ${path.basename(target)}`);
+    // Same trap as `claim`, in reverse: the marker is what pins the id, so
+    // deleting it first leaves the existing index under a name nothing resolves.
+    if (opts.remove) {
+      if (!provider.remove) {
+        ui.fail(`${provider.name} cannot remove indexes`, "configure `tools.remove`, or drop it by hand");
+      }
+      const res = await provider.remove(target);
+      if (res.status === "removed") ui.ok("dropped the index");
+      else if (res.status === "unverified") ui.warn(`${res.detail} — continuing`);
+      else ui.fail(`could not drop the index — ${res.detail}`, "resolve that first; the marker is what makes it findable");
+    }
+    rmSync(dest, { force: true });
+    ui.ok(`removed ${markerFile}`);
+    if (!opts.remove) {
+      const existing = await indexAt(registry, provider.name, target);
+      if (existing) {
+        ui.line();
+        ui.warn(
+          `${provider.name} still holds ${existing.collection ?? "an index"} for this path`,
+          "without the marker it resolves under a different id, so `cleanup` will not reclaim it — re-run with --remove next time, or drop it by hand",
+        );
+      }
+    }
+  });
+
 // ── install-repo / uninstall-repo ──────────────────────────────────────────
 program
   .command("install-repo [repo]")
   .description("Cover a repo that sets its own core.hooksPath (husky, .githooks)")
+  .helpGroup(GROUP.setup)
   .action((repo: string | undefined) => {
     const target = resolveRepo(repo ?? process.cwd());
     const paths = resolvePaths();
@@ -1093,6 +1347,7 @@ program
 program
   .command("uninstall-repo [repo]")
   .description("Undo install-repo, restoring the repo's own core.hooksPath")
+  .helpGroup(GROUP.setup)
   .action((repo: string | undefined) => {
     const target = resolveRepo(repo ?? process.cwd());
     const paths = resolvePaths();
@@ -1108,6 +1363,7 @@ program
 program
   .command("hook <name> [args...]")
   .description("Entry point for git hooks (enqueues only; never indexes inline)")
+  .helpGroup(GROUP.internal)
   .action(async (name: string, args: string[]) => {
     // Unknown hooks are ignored rather than erroring: this runs inside the
     // user's git commands and must never break them.
