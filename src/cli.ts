@@ -15,6 +15,7 @@ import { Command } from "commander";
 import {
   closeSync,
   existsSync,
+  mkdirSync,
   openSync,
   readFileSync,
   readSync,
@@ -1169,6 +1170,26 @@ function providerToClaimWith(cfg: Config, wanted?: string): McpProviderConfig {
   return cfg.providers[0] as McpProviderConfig;
 }
 
+/**
+ * Where a provider's marker file lives inside a repository.
+ *
+ * `detectFiles` is config, and config is hand-edited: a stray `../` would make
+ * `claim` write — and `unclaim` DELETE — outside the repository it was pointed
+ * at. Containment is checked rather than banning separators outright, so a
+ * marker that legitimately sits in a subdirectory still works. (`path.join`
+ * already neutralises an absolute entry; traversal is the case that escapes.)
+ */
+function markerPathIn(repoPath: string, markerFile: string): string {
+  const dest = path.join(repoPath, markerFile);
+  if (!isUnder(dest, repoPath)) {
+    ui.fail(
+      `the marker file "${markerFile}" resolves outside ${repoPath}`,
+      "fix `detectFiles` for this provider — its first entry must stay inside the repository",
+    );
+  }
+  return dest;
+}
+
 /** The index a backend already holds for this exact path, if any. */
 async function indexAt(registry: ProviderRegistry, name: string, repoPath: string) {
   const provider = registry.get(name);
@@ -1230,7 +1251,7 @@ program
           : `add "markerContent" to the provider, or create ${markerFile} yourself`,
       );
     }
-    const dest = path.join(target, markerFile);
+    const dest = markerPathIn(target, markerFile);
     if (existsSync(dest)) {
       ui.fail(`${markerFile} already exists in ${target}`, "remove it first if you meant to replace it");
     }
@@ -1261,6 +1282,7 @@ program
     }
 
     const id = opts.id ?? path.basename(target);
+    mkdirSync(path.dirname(dest), { recursive: true });
     writeFileSync(dest, pcfg.markerContent.replaceAll("${name}", id), "utf8");
     ui.ok(`wrote ${markerFile} (id: ${id})`);
     ui.line();
@@ -1292,7 +1314,7 @@ program
         "there is no marker to remove; drop the provider from your config instead",
       );
     }
-    const dest = path.join(target, markerFile);
+    const dest = markerPathIn(target, markerFile);
     if (!existsSync(dest)) {
       ui.fail(`${markerFile} is not present in ${target}`, "nothing to remove");
     }

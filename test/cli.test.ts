@@ -288,6 +288,38 @@ describe("claim", () => {
     expect(existsSync(path.join(dir, ".stub.json"))).toBe(false);
   });
 
+  it("refuses a marker that would escape the repository", () => {
+    // detectFiles is hand-edited config. A stray `../` would make claim write
+    // outside the repo it was pointed at.
+    writeConfig(provider({ detectFiles: ["../escaped.json"] }));
+    const dir = repo("iota");
+    const r = cli(["claim", dir]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/resolves outside/);
+    expect(existsSync(path.join(home, "escaped.json"))).toBe(false);
+  });
+
+  it("unclaim refuses to delete outside the repository", () => {
+    // The same config, but this path DELETES — so prove a real file next door
+    // survives, not merely that the command exited non-zero.
+    const outside = path.join(home, "precious.json");
+    writeFileSync(outside, "do not delete", "utf8");
+    writeConfig(provider({ detectFiles: ["../precious.json"] }));
+    const r = cli(["unclaim", repo("kappa")]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/resolves outside/);
+    expect(readFileSync(outside, "utf8")).toBe("do not delete");
+  });
+
+  it("still allows a marker in a subdirectory of the repo", () => {
+    // Containment is the rule, not "no separators" — a nested marker is fine.
+    writeConfig(provider({ detectFiles: [".config/stub.json"] }));
+    const dir = repo("lambda");
+    const r = cli(["claim", dir]);
+    expect(r.code).toBe(0);
+    expect(readFileSync(path.join(dir, ".config", "stub.json"), "utf8")).toContain("lambda");
+  });
+
   it("unclaim says so when nothing claims the repo", () => {
     writeConfig(provider());
     const r = cli(["unclaim", repo("theta")]);
