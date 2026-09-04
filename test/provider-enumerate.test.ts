@@ -111,26 +111,102 @@ describe("projects()", () => {
   });
 });
 
+/**
+ * A backend whose remove tool answers politely either way.
+ *
+ * `honest: false` is the shape that caused the bug: it acknowledges the call
+ * and leaves the index in place, which is what a real backend does when it
+ * cannot resolve a project whose directory has already been deleted.
+ *
+ * Whether the index is gone is kept in a FILE, not a variable, because a real
+ * backend's project listing is durable state rather than per-process progress.
+ * That is what makes confirming in a fresh child legitimate here — and the
+ * stub has to model it, or an honest removal would look like a failed one.
+ */
+function removeStub(opts: { honest: boolean; listAs?: string }): string {
+  const listed = JSON.stringify(opts.listAs ?? "/a");
+  return stub(`
+import { existsSync, writeFileSync } from "node:fs";
+const gone = process.argv[1] + ".removed";
+function handle(msg) {
+  if (msg.method === "initialize") return send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  if (msg.method !== "tools/call") return;
+  const name = msg.params?.name;
+  const text = (t) => send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: t }] } });
+  if (name === "r") {
+    if (${opts.honest ? "true" : "false"}) writeFileSync(gone, "1");
+    // Either way the reply is a cheerful success.
+    return text("Removed index for: /a");
+  }
+  if (name === "l") {
+    return text(existsSync(gone) ? "No projects have been indexed." : "  - " + ${listed});
+  }
+}`);
+}
+
 describe("remove()", () => {
-  it("reports success when the backend accepts", async () => {
-    const p = providerFor(stub(TEXT("Removed index for: /a")), { remove: "r" });
-    expect(await p.remove("/a")).toBe(true);
+  it("confirms a removal against the backend's own listing", async () => {
+    const p = providerFor(removeStub({ honest: true }), { remove: "r", list: "l" });
+    expect(await p.remove("/a")).toEqual({ status: "removed" });
   });
 
-  it("is false when the backend cannot remove", async () => {
-    const p = providerFor(stub(TEXT("x")), {});
-    expect(await p.remove("/a")).toBe(false);
+  it("fails when the backend acknowledges but the index is still listed", async () => {
+    // The regression. `cleanup --apply` printed "removed" and the very next
+    // `cleanup` listed the same repo as an orphan again, forever.
+    const got = await providerFor(removeStub({ honest: false }), {
+      remove: "r",
+      list: "l",
+    }).remove("/a");
+    expect(got.status).toBe("failed");
+    expect(got.detail).toMatch(/still lists/i);
   });
 
-  it("is false on a tool error rather than throwing", async () => {
-    const p = providerFor(
+  it("is not fooled by a differently spelled path in the listing", async () => {
+    // A trailing slash must not read as "some other project, so mine is gone".
+    const got = await providerFor(removeStub({ honest: false, listAs: "/a/" }), {
+      remove: "r",
+      list: "l",
+    }).remove("/a");
+    expect(got.status).toBe("failed");
+  });
+
+  it("says it could not confirm when the backend cannot enumerate", async () => {
+    // No list tool: the reply is all there is, and that is worth admitting
+    // rather than dressing up as proof.
+    const got = await providerFor(removeStub({ honest: true }), { remove: "r" }).remove("/a");
+    expect(got.status).toBe("unverified");
+    expect(got.detail).toMatch(/tools\.list/);
+  });
+
+  it("says it could not confirm when the listing itself fails", async () => {
+    const got = await providerFor(
       stub(`function handle(msg) {
         if (msg.method === "initialize") return send({ jsonrpc: "2.0", id: msg.id, result: {} });
-        if (msg.method === "tools/call") return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "no" } });
+        if (msg.params?.name === "r")
+          return send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "Removed" }] } });
+        return send({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: "nope" }] } });
       }`),
-      { remove: "r" },
-    );
-    expect(await p.remove("/a")).toBe(false);
+      { remove: "r", list: "l" },
+    ).remove("/a");
+    expect(got.status).toBe("unverified");
+  });
+
+  it("fails when the backend has no remove tool", async () => {
+    const got = await providerFor(stub(TEXT("x")), {}).remove("/a");
+    expect(got.status).toBe("failed");
+    expect(got.detail).toMatch(/tools\.remove/);
+  });
+
+  it("fails with the backend's reason on a tool error rather than throwing", async () => {
+    const got = await providerFor(
+      stub(`function handle(msg) {
+        if (msg.method === "initialize") return send({ jsonrpc: "2.0", id: msg.id, result: {} });
+        if (msg.method === "tools/call") return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "no such tool" } });
+      }`),
+      { remove: "r", list: "l" },
+    ).remove("/a");
+    expect(got.status).toBe("failed");
+    expect(got.detail).toContain("no such tool");
   });
 });
 

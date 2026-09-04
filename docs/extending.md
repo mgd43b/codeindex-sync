@@ -44,6 +44,11 @@ write code. Describe it in `~/.config/codeindex-sync/config.json`:
 reports nothing for that provider rather than failing — and an asynchronous
 `index` cannot be verified, so configure `status` if you configure `index`.
 
+**`tools.list` is what makes `tools.remove` trustworthy.** A removal is confirmed
+against the backend's own listing, so configuring `remove` without `list` leaves
+`cleanup --apply` able to ask but not to check — it will say so rather than
+claim a removal it cannot see. See below.
+
 **`detectFiles` decides routing.** When several providers are configured, the
 first one claiming a repo wins, in config order. A marker file is the usual
 mechanism — it also lets a repo opt in explicitly. An empty list means "claim
@@ -97,6 +102,34 @@ The wait is bounded by the caller's abort signal and by the session's own hard
 timer, which kills the child and makes every later call fail at once. Both end as
 a failure: a backend that never finishes must never look like one that did.
 
+**A removal is verified, not assumed.** `cleanup`'s entire input is indexes whose
+directory is gone — that is the definition of an orphan — and a backend that
+identifies an index by a marker *inside* the repository cannot resolve it once
+the directory is deleted. It then removes nothing, has nothing to complain
+about, and answers without an error. Believing that reply is how `cleanup
+--apply` printed `✔ removed` while the index stayed put and re-appeared as an
+orphan on the very next run, forever.
+
+So `remove()` calls the tool and then re-reads `tools.list`, reporting one of
+three things — and only the first is shown as removed:
+
+| Outcome | Meaning |
+| --- | --- |
+| `removed` | The backend no longer lists the index |
+| `failed` | The tool errored, or the index is still listed afterwards |
+| `unverified` | The tool was accepted, but no `tools.list` was available to confirm it |
+
+Unlike a slow index call, this check does *not* need to share a session: a
+project listing is durable backend state rather than per-process progress, so
+asking again in a fresh process is stricter, not weaker — it proves the removal
+is visible to the next process, which is exactly what the next `cleanup` run
+will be.
+
+When a removal fails this way, the fix is usually to give the backend back the
+marker it needs: recreate the directory with just that file (`detectFiles` names
+it) and remove the index with the backend's own tooling. `cleanup` prints that
+advice, built from your `detectFiles`.
+
 **`env` exists because git hooks are not a login shell.** They never source
 `~/.bashrc`, `~/.zshenv` or any profile, so anything you export in a shell is
 invisible to the indexer. If your backend needs configuration, it goes here or in
@@ -122,6 +155,9 @@ export class MyProvider implements IndexProvider {
   async index(req) { /* → { status: "ok" | "busy" | "failed", summary } */ }
   async health() { /* → ProviderHealth[]; must never throw */ return []; }
   async status(repoPath: string) { return null; }
+  // Optional. Must confirm against the backend before reporting "removed".
+  // → { status: "removed" } | { status: "unverified" | "failed", detail: string }
+  async remove(repoPath: string) { /* must confirm before reporting "removed" */ }
 }
 ```
 
