@@ -1,9 +1,19 @@
 # codeindex-sync
 
+[![npm](https://img.shields.io/npm/v/codeindex-sync)](https://www.npmjs.com/package/codeindex-sync)
+[![ci](https://github.com/mgd43b/codeindex-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/mgd43b/codeindex-sync/actions/workflows/ci.yml)
+[![node](https://img.shields.io/node/v/codeindex-sync)](https://nodejs.org)
+[![licence](https://img.shields.io/npm/l/codeindex-sync)](LICENSE)
+
 Keep code indexes in sync with git activity — for any MCP backend.
 
 Commit, merge, rebase or switch branches, and the affected repository is
 re-indexed in the background within seconds. Nothing to run by hand.
+
+![Committing a change: the post-commit hook queues it, a detached drain indexes it, and codeindex-sync doctor reports every part green](https://raw.githubusercontent.com/mgd43b/codeindex-sync/main/docs/demo.gif)
+
+<sub>Recorded against a stub MCP backend, which is also the point: nothing in
+this project knows what a backend is. Regenerate with `vhs demo/demo.tape`.</sub>
 
 Any indexer that speaks MCP works, described entirely in config.
 [SocratiCode](https://github.com/giancarloerra/socraticode) is the backend this
@@ -122,9 +132,15 @@ in the worker, the abstraction has leaked.
 
 ## Releasing
 
-See [docs/releasing.md](docs/releasing.md). Publishing to npm requires
-credentials and is a manual step; the Homebrew formula is generated from the
-published tarball by `scripts/update-tap.sh`.
+[release-please](https://github.com/googleapis/release-please) keeps a release
+PR open with the version bump and changelog it would produce; merging it tags,
+releases and publishes. Packages are published from CI with
+[provenance](https://docs.npmjs.com/generating-provenance-statements), so a
+tarball can be traced back to the commit and workflow that built it. The
+Homebrew formula is generated from the published tarball by
+`scripts/update-tap.sh`.
+
+See [docs/releasing.md](docs/releasing.md).
 
 ## Requirements
 
