@@ -47,6 +47,10 @@ export const PRESETS: Preset[] = [
       // A repo opts in by carrying this marker, which also pins a stable
       // project id so the index follows the repo rather than its path.
       detectFiles: [".socraticode.json"],
+      // Pinning the id is the point: without it SocratiCode derives a collection
+      // name from a hash of the absolute path, so the same repo at a second path
+      // — a worktree, a CI clone — becomes a separate duplicate index.
+      markerContent: '{"projectId":"${name}"}\n',
       busyMarkers: ["another indexer", "BUSY"],
       timeoutMs: 60 * 60 * 1000,
     },

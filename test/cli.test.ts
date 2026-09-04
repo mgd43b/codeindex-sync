@@ -6,7 +6,7 @@
  * reads on a failure, and whether a first run teaches or just reports emptiness.
  */
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -75,6 +75,28 @@ describe("basics", () => {
     for (const cmd of ["init", "doctor", "status", "sync", "providers", "install"]) {
       expect(out).toContain(cmd);
     }
+  });
+
+  it("groups help by task, in a declared order", () => {
+    // Commander orders groups by whichever command happens to be registered
+    // first, so without an explicit order this silently reshuffles when someone
+    // adds a command. The point of grouping is that `--help` answers "what do I
+    // run next?", which it cannot do if the sequence is an accident.
+    const out = cli(["--help"]).out;
+    const headings = ["Everyday:", "Setup:", "Scheduling:", "Queue:", "Diagnostics:"];
+    const seen = headings.map((h) => out.indexOf(h));
+    expect(seen.every((i) => i >= 0)).toBe(true);
+    expect(seen).toEqual([...seen].sort((a, b) => a - b));
+  });
+
+  it("puts every command under a group, leaving none stranded", () => {
+    // A command with no .helpGroup() falls into commander's default bucket at
+    // the bottom, which is exactly the ungrouped list this replaced.
+    const out = cli(["--help"]).out;
+    const tail = out.slice(out.indexOf("Commands:"));
+    // `help` is commander's own and is the only thing allowed to sit there.
+    const strays = tail.split("\n").filter((l) => /^\s{2}\S/.test(l) && !l.includes("help ["));
+    expect(strays).toEqual([]);
   });
 });
 
@@ -161,6 +183,148 @@ describe("errors carry a remedy, never a stack trace", () => {
     const r = cli(["init", "--preset", "nope"]);
     expect(r.code).toBe(1);
     expect(r.out).toMatch(/socraticode/);
+  });
+});
+
+describe("claim", () => {
+  const provider = (extra: Record<string, unknown> = {}): unknown => ({
+    root: home,
+    providers: [
+      {
+        name: "stub",
+        command: "true",
+        args: [],
+        tools: { update: "u" },
+        detectFiles: [".stub.json"],
+        markerContent: '{"projectId":"${name}"}\n',
+        ...extra,
+      },
+    ],
+  });
+
+  function repo(name: string): string {
+    const dir = path.join(home, name);
+    mkdirSync(dir, { recursive: true });
+    execFileSync("git", ["init", "-q", dir], { stdio: "ignore" });
+    return dir;
+  }
+
+  it("writes the marker with the repo name as the id", () => {
+    writeConfig(provider());
+    const dir = repo("alpha");
+    const r = cli(["claim", dir]);
+    expect(r.code).toBe(0);
+    expect(readFileSync(path.join(dir, ".stub.json"), "utf8")).toBe('{"projectId":"alpha"}\n');
+  });
+
+  it("honours an explicit --id", () => {
+    writeConfig(provider());
+    const dir = repo("beta");
+    cli(["claim", dir, "--id", "pinned-name"]);
+    expect(readFileSync(path.join(dir, ".stub.json"), "utf8")).toContain("pinned-name");
+  });
+
+  it("says so and changes nothing when the repo is already claimed", () => {
+    writeConfig(provider());
+    const dir = repo("gamma");
+    writeFileSync(path.join(dir, ".stub.json"), "original", "utf8");
+    const r = cli(["claim", dir]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/already claimed/);
+    expect(readFileSync(path.join(dir, ".stub.json"), "utf8")).toBe("original");
+  });
+
+  it("refuses a repo outside the configured root", () => {
+    // A global hooksPath fires everywhere, but anything outside root is ignored
+    // by design — so a marker there would be a file that never does anything.
+    writeConfig({ ...(provider() as object), root: path.join(home, "elsewhere") });
+    const dir = repo("delta");
+    const r = cli(["claim", dir]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/outside the configured root/);
+    expect(existsSync(path.join(dir, ".stub.json"))).toBe(false);
+  });
+
+  it("names the provider to pick when several are configured", () => {
+    const cfg = provider() as { providers: unknown[] };
+    cfg.providers.push({
+      name: "other",
+      command: "true",
+      tools: { update: "u" },
+      detectFiles: [".other.json"],
+    });
+    writeConfig(cfg);
+    const r = cli(["claim", repo("eps")]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/--provider/);
+  });
+
+  it("points at the preset's own value when the config has no marker template", () => {
+    // Configs written before markerContent existed have none, and there is no
+    // backend-agnostic default to invent — so say exactly what to paste.
+    writeConfig({
+      root: home,
+      providers: [
+        {
+          name: "socraticode",
+          command: "true",
+          tools: { update: "u" },
+          detectFiles: [".socraticode.json"],
+        },
+      ],
+    });
+    const r = cli(["claim", repo("zeta")]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/markerContent/);
+    expect(r.out).toMatch(/projectId/);
+  });
+
+  it("unclaim removes the marker again", () => {
+    writeConfig(provider());
+    const dir = repo("eta");
+    cli(["claim", dir]);
+    const r = cli(["unclaim", dir]);
+    expect(r.code).toBe(0);
+    expect(existsSync(path.join(dir, ".stub.json"))).toBe(false);
+  });
+
+  it("refuses a marker that would escape the repository", () => {
+    // detectFiles is hand-edited config. A stray `../` would make claim write
+    // outside the repo it was pointed at.
+    writeConfig(provider({ detectFiles: ["../escaped.json"] }));
+    const dir = repo("iota");
+    const r = cli(["claim", dir]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/resolves outside/);
+    expect(existsSync(path.join(home, "escaped.json"))).toBe(false);
+  });
+
+  it("unclaim refuses to delete outside the repository", () => {
+    // The same config, but this path DELETES — so prove a real file next door
+    // survives, not merely that the command exited non-zero.
+    const outside = path.join(home, "precious.json");
+    writeFileSync(outside, "do not delete", "utf8");
+    writeConfig(provider({ detectFiles: ["../precious.json"] }));
+    const r = cli(["unclaim", repo("kappa")]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/resolves outside/);
+    expect(readFileSync(outside, "utf8")).toBe("do not delete");
+  });
+
+  it("still allows a marker in a subdirectory of the repo", () => {
+    // Containment is the rule, not "no separators" — a nested marker is fine.
+    writeConfig(provider({ detectFiles: [".config/stub.json"] }));
+    const dir = repo("lambda");
+    const r = cli(["claim", dir]);
+    expect(r.code).toBe(0);
+    expect(readFileSync(path.join(dir, ".config", "stub.json"), "utf8")).toContain("lambda");
+  });
+
+  it("unclaim says so when nothing claims the repo", () => {
+    writeConfig(provider());
+    const r = cli(["unclaim", repo("theta")]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/no configured provider claims/);
   });
 });
 
