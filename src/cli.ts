@@ -49,7 +49,7 @@ import {
   repoCoverage,
   uninstallRepoDispatcher,
 } from "./install.js";
-import { WorkerLock } from "./lock.js";
+import { WorkerLock, ensureStateDirs, holderLabel } from "./lock.js";
 import { Logger } from "./logger.js";
 import { isUnder, resolvePaths } from "./paths.js";
 import { PRESETS, findPreset } from "./presets.js";
@@ -635,141 +635,190 @@ program
       }
     }
 
-    const reports: VerifyReport[] = [];
-    for (const job of jobs) {
+    /**
+     * A repair is a read-modify-write against state the worker also writes, so
+     * it takes the worker's own lock — the mechanism this project already has
+     * for "only one thing touches a backend at a time".
+     *
+     * Qdrant offers no compare-and-swap, so the alternative is detecting a
+     * collision after the fact rather than preventing one. This closes the case
+     * that actually happens: a scheduled drain firing on its timer while
+     * someone repairs by hand. It cannot serialise against a backend run from
+     * somewhere else, which is why the post-write collision check stays.
+     *
+     * Held across the read as well as the write — a stranded set computed from
+     * a map that then moves is the very thing being guarded against — and only
+     * for `--repair`. A read-only verify takes no lock and blocks nothing.
+     */
+    const paths = resolvePaths();
+    const lock = opts.repair ? new WorkerLock(paths.lock) : undefined;
+    if (lock) {
+      let got;
       try {
-        reports.push(
-          await verifyCollection(q, job.collection, {
-            // The tree the caller named wins over the one the metadata
-            // remembers: they differ exactly when an index has been re-pointed
-            // at a worktree, and the caller's is the tree they care about.
-            ...(job.projectPath === undefined ? {} : { projectPath: job.projectPath }),
-          }),
-        );
+        // The lock is a directory, and `acquire` deliberately does not create
+        // parents — on a machine where nothing has drained yet, the state
+        // directory does not exist at all and the bare mkdir raises ENOENT.
+        ensureStateDirs([paths.state]);
+        got = lock.acquire();
       } catch (err) {
+        // Taking the lock can fail for reasons that are nothing to do with
+        // contention — an unwritable state directory, a read-only filesystem.
+        // The top-level handler would already keep a stack trace off the
+        // screen, but it has no idea what to suggest, and a diagnosis without
+        // a next step is half a diagnosis.
         ui.fail(
-          err instanceof QdrantError ? err.message : String(err),
-          `check that ${q.endpoint} is reachable and the API key in ${configPath()} is current`,
+          `could not take the worker lock: ${err instanceof Error ? err.message : String(err)}`,
+          `check that ${paths.state} is writable`,
+        );
+      }
+      if (!got.acquired) {
+        ui.fail(
+          `the worker is indexing right now${holderLabel(got.heldBy)}, and a repair would race it`,
+          `wait for it to finish — ${ui.style.cyan("codeindex-sync status")} shows when it is idle`,
         );
       }
     }
-
-    const tracked = target ? trackedFileCount(target) : null;
-
-    const emitJson = (repair?: RepairResult | { skipped: string }): void => {
-      process.stdout.write(
-        JSON.stringify(
-          {
-            endpoint: q.endpoint,
-            ...(tracked === null ? {} : { trackedFiles: tracked }),
-            reports,
-            ...(repair === undefined ? {} : { repair }),
-          },
-          null,
-          2,
-        ) + "\n",
-      );
-    };
-
-    if (opts.json && !opts.repair) {
-      emitJson();
-      if (reports.some((r) => r.stranded.length > 0)) process.exitCode = 1;
-      return;
-    }
-
-    if (!opts.json) ui.heading(target ? path.basename(target) : "All indexes");
-    let clean = true;
-    for (const r of reports) {
-      if (r.stranded.length > 0) clean = false;
-      if (opts.json) continue;
-      const hint = target
-        ? `${ui.style.cyan(`codeindex-sync verify ${repo} --repair`)}, then ${ui.style.cyan(`codeindex-sync sync ${repo}`)}`
-        : `re-run against that repository with ${ui.style.cyan("--repair")} to fix it`;
-      renderReport(r, hint);
-    }
-
-    const first = reports[0];
-    if (!opts.json && target && first && first.projectPath && path.resolve(first.projectPath) !== target) {
-      // The metadata's own idea of which tree it describes has drifted, which
-      // is what happens when something indexed a linked worktree under this
-      // repository's collection. Reported because the numbers above are about
-      // that other tree, not this one.
-      ui.warn(
-        `the index records its project as ${first.projectPath}`,
-        `re-point it at this checkout: ${ui.style.cyan(`codeindex-sync sync ${repo} --full`)}`,
-      );
-    }
-    if (tracked !== null && !opts.json) {
-      // Informational only, and never part of the verdict: the backend indexes
-      // a subset of tracked files by rules this tool does not model, so any
-      // threshold on this number would be an invention.
-      ui.info(`git tracks ${tracked} files here; the backend indexes a subset of them`);
-    }
-
-    if (!opts.repair) {
-      if (!clean) process.exitCode = 1;
-      return;
-    }
-
-    // ── repair ──
-    const report = reports[0];
-    if (!report || report.stranded.length === 0) {
-      if (opts.json) emitJson({ removed: [], remaining: report?.claimed ?? 0, collided: false });
-      else {
-        ui.line();
-        ui.info("nothing to repair");
-      }
-      return;
-    }
-    // Mid-run, a file can be claimed before its chunks land. Rewriting the hash
-    // map then would discard work that is still arriving, so this waits rather
-    // than guessing which findings are real.
-    if (report.indexingStatus === "in-progress") {
-      if (opts.json) emitJson({ skipped: "indexing in progress" });
-      else {
-        ui.line();
-        ui.warn(
-          "an index run is in progress, so this may not be damage at all — skipped",
-          `let it finish, then re-run ${ui.style.cyan(`codeindex-sync verify ${repo}`)}`,
-        );
-      }
-      process.exitCode = 1;
-      return;
-    }
-
+    // A `ui.fail` inside exits while holding this; the lock is reclaimable by
+    // design once its holder is gone, so the next acquirer clears it.
     try {
-      const result = await repairCollection(q, report.collection, report.stranded);
-      if (opts.json) {
-        emitJson(result);
+      const reports: VerifyReport[] = [];
+      for (const job of jobs) {
+        try {
+          reports.push(
+            await verifyCollection(q, job.collection, {
+              // The tree the caller named wins over the one the metadata
+              // remembers: they differ exactly when an index has been re-pointed
+              // at a worktree, and the caller's is the tree they care about.
+              ...(job.projectPath === undefined ? {} : { projectPath: job.projectPath }),
+            }),
+          );
+        } catch (err) {
+          ui.fail(
+            err instanceof QdrantError ? err.message : String(err),
+            `check that ${q.endpoint} is reachable and the API key in ${configPath()} is current`,
+          );
+        }
+      }
+
+      const tracked = target ? trackedFileCount(target) : null;
+
+      const emitJson = (repair?: RepairResult | { skipped: string }): void => {
+        process.stdout.write(
+          JSON.stringify(
+            {
+              endpoint: q.endpoint,
+              ...(tracked === null ? {} : { trackedFiles: tracked }),
+              reports,
+              ...(repair === undefined ? {} : { repair }),
+            },
+            null,
+            2,
+          ) + "\n",
+        );
+      };
+
+      if (opts.json && !opts.repair) {
+        emitJson();
+        if (reports.some((r) => r.stranded.length > 0)) process.exitCode = 1;
         return;
       }
-      ui.line();
-      ui.ok(
-        `dropped ${result.removed.length} stranded entr${result.removed.length === 1 ? "y" : "ies"}; ${result.remaining} left`,
-      );
-      if (result.collided) {
-        // Bounded and self-correcting, but the user should not learn about it
-        // from a second verify reporting something new.
+
+      if (!opts.json) ui.heading(target ? path.basename(target) : "All indexes");
+      let clean = true;
+      for (const r of reports) {
+        if (r.stranded.length > 0) clean = false;
+        if (opts.json) continue;
+        const hint = target
+          ? `${ui.style.cyan(`codeindex-sync verify ${repo} --repair`)}, then ${ui.style.cyan(`codeindex-sync sync ${repo}`)}`
+          : `re-run against that repository with ${ui.style.cyan("--repair")} to fix it`;
+        renderReport(r, hint);
+      }
+
+      const first = reports[0];
+      if (!opts.json && target && first && first.projectPath && path.resolve(first.projectPath) !== target) {
+        // The metadata's own idea of which tree it describes has drifted, which
+        // is what happens when something indexed a linked worktree under this
+        // repository's collection. Reported because the numbers above are about
+        // that other tree, not this one.
         ui.warn(
-          "an index run wrote this index while the repair was in flight",
-          `re-run ${ui.style.cyan(`codeindex-sync verify ${repo}`)} once it settles`,
+          `the index records its project as ${first.projectPath}`,
+          `re-point it at this checkout: ${ui.style.cyan(`codeindex-sync sync ${repo} --full`)}`,
         );
       }
-      ui.info(`those files re-index on the next sync: ${ui.style.cyan(`codeindex-sync sync ${repo}`)}`);
-    } catch (err) {
-      if (err instanceof RepairRefused) {
-        ui.line();
-        ui.warn(
-          err.message,
-          `let it finish, then re-run ${ui.style.cyan(`codeindex-sync verify ${repo}`)}`,
-        );
+      if (tracked !== null && !opts.json) {
+        // Informational only, and never part of the verdict: the backend indexes
+        // a subset of tracked files by rules this tool does not model, so any
+        // threshold on this number would be an invention.
+        ui.info(`git tracks ${tracked} files here; the backend indexes a subset of them`);
+      }
+
+      if (!opts.repair) {
+        if (!clean) process.exitCode = 1;
+        return;
+      }
+
+      // ── repair ──
+      const report = reports[0];
+      if (!report || report.stranded.length === 0) {
+        if (opts.json) emitJson({ removed: [], remaining: report?.claimed ?? 0, collided: false });
+        else {
+          ui.line();
+          ui.info("nothing to repair");
+        }
+        return;
+      }
+      // Mid-run, a file can be claimed before its chunks land. Rewriting the hash
+      // map then would discard work that is still arriving, so this waits rather
+      // than guessing which findings are real.
+      if (report.indexingStatus === "in-progress") {
+        if (opts.json) emitJson({ skipped: "indexing in progress" });
+        else {
+          ui.line();
+          ui.warn(
+            "an index run is in progress, so this may not be damage at all — skipped",
+            `let it finish, then re-run ${ui.style.cyan(`codeindex-sync verify ${repo}`)}`,
+          );
+        }
         process.exitCode = 1;
         return;
       }
-      ui.fail(
-        err instanceof Error ? err.message : String(err),
-        `check that ${q.endpoint} is reachable and the API key in ${configPath()} is current`,
-      );
+
+      try {
+        const result = await repairCollection(q, report.collection, report.stranded);
+        if (opts.json) {
+          emitJson(result);
+          return;
+        }
+        ui.line();
+        ui.ok(
+          `dropped ${result.removed.length} stranded entr${result.removed.length === 1 ? "y" : "ies"}; ${result.remaining} left`,
+        );
+        if (result.collided) {
+          // Bounded and self-correcting, but the user should not learn about it
+          // from a second verify reporting something new.
+          ui.warn(
+            "an index run wrote this index while the repair was in flight",
+            `re-run ${ui.style.cyan(`codeindex-sync verify ${repo}`)} once it settles`,
+          );
+        }
+        ui.info(`those files re-index on the next sync: ${ui.style.cyan(`codeindex-sync sync ${repo}`)}`);
+      } catch (err) {
+        if (err instanceof RepairRefused) {
+          ui.line();
+          ui.warn(
+            err.message,
+            `let it finish, then re-run ${ui.style.cyan(`codeindex-sync verify ${repo}`)}`,
+          );
+          process.exitCode = 1;
+          return;
+        }
+        ui.fail(
+          err instanceof Error ? err.message : String(err),
+          `check that ${q.endpoint} is reachable and the API key in ${configPath()} is current`,
+        );
+      }
+    } finally {
+      lock?.release();
     }
   });
 

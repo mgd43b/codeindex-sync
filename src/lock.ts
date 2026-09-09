@@ -115,6 +115,18 @@ export class WorkerLock {
   }
 }
 
+/**
+ * How to name a lock's holder in a message.
+ *
+ * `acquire` reports -1 when the holder could not be read at all — a lock
+ * directory that raced out from under the reclaim loop, which is rare and says
+ * nothing useful. "pid -1" reads like a bug in this tool rather than a busy
+ * worker, so an unknown holder is not named at all.
+ */
+export function holderLabel(heldBy: number): string {
+  return heldBy > 0 ? ` (pid ${heldBy})` : "";
+}
+
 export function ensureStateDirs(dirs: string[]): void {
   for (const d of dirs) mkdirSync(d, { recursive: true });
 }
