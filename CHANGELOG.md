@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/mgd43b/codeindex-sync/compare/v0.1.0...v0.1.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* **provider:** disable backend startup auto-indexing in spawned sessions ([#22](https://github.com/mgd43b/codeindex-sync/issues/22)) ([1e6dd2f](https://github.com/mgd43b/codeindex-sync/commit/1e6dd2fab01c41f550b8b55d68256c87fd5ffbce))
+
 ## 0.1.0 (2026-09-04)
 
 
