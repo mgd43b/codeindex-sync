@@ -311,13 +311,28 @@ export class McpIndexProvider implements IndexProvider {
    * repo is not always there — `cleanup` acts on paths that are gone by
    * definition — so fall back to somewhere that exists rather than spawning
    * into ENOENT.
+   *
+   * Startup indexing is disabled. A backend built for MCP *hosts* reasonably
+   * treats "started with a cwd inside a project" as "the user opened this
+   * project, catch it up" — SocratiCode does exactly that, skipping only when
+   * cwd is `/` or `$HOME`. We are not a host: we drive indexing explicitly
+   * through the index/update tools, and every session here is a short-lived
+   * tool call. Leaving it on made read-only commands mutate:
+   *
+   *   - `list --all` run inside a repo triggered a full re-index of it, so the
+   *     listing reported the in-progress write it had just caused;
+   *   - worse, a session spawned with cwd in a linked worktree re-pointed that
+   *     project at the worktree and pruned the main checkout's content.
+   *
+   * Set after process.env so an ambient value cannot re-enable it, and before
+   * cfg.env so an operator still can.
    */
   private sessionOpts(repoPath: string | undefined, timeoutMs: number | undefined): McpClientOptions {
     return {
       command: this.cfg.command,
       args: this.cfg.args,
       cwd: safeCwd(repoPath),
-      env: { ...process.env, ...this.cfg.env },
+      env: { ...process.env, SOCRATICODE_AUTO_RESUME: "off", ...this.cfg.env },
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
     };
   }
