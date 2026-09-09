@@ -142,6 +142,23 @@ advice, built from your `detectFiles`.
 invisible to the indexer. If your backend needs configuration, it goes here or in
 a file the hook path reads directly — never in a shell profile.
 
+### One thing config cannot describe: integrity
+
+`codeindex-sync verify` is the single command that does not go through the
+provider interface. It compares what an index *claims* to hold — the file-hash
+map the backend keeps — against what it actually holds, and no MCP tool exposes
+either side, so it reads the backend's store directly.
+
+That makes it backend-specific by construction, and it is deliberately fenced
+off: `src/qdrant.ts` and `src/verify.ts` are the only files that know a storage
+engine exists, and nothing in the worker, the queue or the provider interface
+imports them. Every other command still works against any MCP backend.
+
+Supporting a different store would mean a second implementation behind the same
+two questions — "what does this index claim?" and "what does it hold?" — rather
+than a change to `IndexProvider`. A backend that grows a tool answering those
+would be better still, and would make this command config-only like the rest.
+
 ### If config isn't enough
 
 A backend that needs real code is a signal the `IndexProvider` interface is

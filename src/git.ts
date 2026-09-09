@@ -187,3 +187,17 @@ export function removeWorktree(repo: string, dir: string, force = false): boolea
 export function deleteBranch(repo: string, branch: string): boolean {
   return git(["branch", "-D", branch], repo) !== null;
 }
+
+/**
+ * How many files git tracks in this repository.
+ *
+ * A coarse cue and nothing more: the backend indexes a subset by rules this
+ * tool deliberately does not model, so this number and an index's file count
+ * are never expected to match. Reported alongside a verification, never used
+ * to decide one.
+ */
+export function trackedFileCount(dir: string): number | null {
+  const out = git(["ls-files"], dir);
+  if (out === null) return null;
+  return out.length === 0 ? 0 : out.split("\n").length;
+}

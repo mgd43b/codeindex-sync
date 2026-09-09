@@ -53,6 +53,7 @@ behaviour here comes from a failure seen in production:
 | **Crashes** | A worker that dies mid-job silently drops that repository forever |
 | **Backend contention** | The backend's own lock is misread as failure, parking healthy repos in `failed/` |
 | **Hooks aren't a login shell** | Config exported in `~/.bashrc` is invisible to the indexer, which then writes to the wrong place — silently |
+| **Silent index damage** | A partial write recorded as a success leaves a file claimed-but-empty forever; nothing re-indexes it, and search just quietly gets worse |
 
 ## Commands
 
@@ -63,6 +64,7 @@ behaviour here comes from a failure seen in production:
 | `status` | Queue, worker and failures |
 | `list [repo] [--all] [--stale] [--json]` | What the backend holds — one repo, or every index with status, age and file counts |
 | `sync [repo] [--full]` | Index now |
+| `verify [repo] [--repair]` | Compare what an index claims to hold against what it actually holds |
 | `drain` / `once` | Process the queue |
 | `retry` / `forget` | Manage failed jobs |
 | `unlock [--force]` | Release a stale worker lock |
@@ -129,6 +131,13 @@ in the worker, the abstraction has leaked.
 - **`busy` is not failure.** Contention requeues without burning an attempt.
 - **The log is the diagnostic.** Append-only, rotated not truncated, and writing
   to it never throws.
+- **`verify` is the one deliberate exception.** Every other command drives a
+  backend through the MCP tools it declares. Integrity has no such tool to call
+  — "which files does this index claim, and which have content?" is answerable
+  only from storage — so `verify` reads the backend's store directly, and is
+  the only part of this project that is not backend-agnostic. It is confined to
+  `qdrant.ts` and `verify.ts`, reached only from the `verify` command — the
+  worker, the queue and the provider interface never touch it.
 
 ## Releasing
 

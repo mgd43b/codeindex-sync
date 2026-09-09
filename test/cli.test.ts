@@ -5,12 +5,13 @@
  * here are exactly the things unit tests cannot see: exit codes, what a human
  * reads on a failure, and whether a first run teaches or just reports emptiness.
  */
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { Queue } from "../src/queue.js";
+import { metadataPointId } from "../src/verify.js";
 
 const CLI = path.resolve("dist/cli.js");
 let home: string;
@@ -37,19 +38,35 @@ interface Run {
   out: string;
 }
 
-/** NO_COLOR keeps assertions readable; an isolated HOME keeps git config safe. */
+/**
+ * NO_COLOR keeps assertions readable; an isolated HOME keeps git config safe.
+ *
+ * A developer's shell very often exports a *real* backend's QDRANT_URL and key,
+ * and commands that fall back to the ambient environment would then reach it
+ * from a test run. Those variables are stripped from every child rather than
+ * remembered case by case, so a test can only ever talk to a backend it was
+ * explicitly handed one.
+ */
+const BACKEND_ENV = [
+  "QDRANT_URL",
+  "QDRANT_API_KEY",
+  "QDRANT_COLLECTION_PREFIX",
+  "QDRANT_MODE",
+] as const;
+
 function cli(args: string[], env: Record<string, string> = {}): Run {
+  const childEnv: Record<string, string | undefined> = {
+    ...process.env,
+    HOME: home,
+    NO_COLOR: "1",
+    CODEINDEX_SYNC_STATE: state,
+    CODEINDEX_SYNC_CONFIG: cfgFile,
+  };
+  for (const key of BACKEND_ENV) delete childEnv[key];
   try {
     const out = execFileSync(process.execPath, [CLI, ...args], {
       encoding: "utf8",
-      env: {
-        ...process.env,
-        HOME: home,
-        NO_COLOR: "1",
-        CODEINDEX_SYNC_STATE: state,
-        CODEINDEX_SYNC_CONFIG: cfgFile,
-        ...env,
-      },
+      env: { ...childEnv, ...env },
       stdio: ["ignore", "pipe", "pipe"],
     });
     return { code: 0, out };
@@ -495,5 +512,301 @@ describe("hook entry point", () => {
   it("exits 0 when run outside any repository", () => {
     cli(["init", "--preset", "socraticode"]);
     expect(cli(["hook", "post-commit"]).code).toBe(0);
+  });
+});
+
+/**
+ * A stand-in Qdrant, run as its own process.
+ *
+ * It has to be a separate process, not an in-test server: `cli()` shells out
+ * with `execFileSync`, which blocks this process's event loop for the whole
+ * run, so a server living here could never answer the request it is waiting on.
+ * State lives in a JSON file for the same reason — it is the only channel the
+ * two processes share, and it lets a test read back exactly what a repair wrote.
+ */
+const QDRANT_STUB = `
+import { createServer } from "node:http";
+import { readFileSync, writeFileSync } from "node:fs";
+
+const [stateFile, portFile] = process.argv.slice(2);
+const load = () => JSON.parse(readFileSync(stateFile, "utf8"));
+
+const server = createServer((req, res) => {
+  let raw = "";
+  req.on("data", (c) => (raw += c));
+  req.on("end", () => {
+    const state = load();
+    const body = raw ? JSON.parse(raw) : {};
+    const url = req.url ?? "";
+    const name = decodeURIComponent(url.split("/")[2] ?? "");
+    const isMeta = name.endsWith("socraticode_metadata");
+    const send = (status, json) => {
+      res.writeHead(status, { "content-type": "application/json" });
+      res.end(JSON.stringify(json));
+    };
+    if (req.method === "GET") {
+      if (isMeta) return send(200, { result: { status: "green", points_count: Object.keys(state.meta).length } });
+      if (!(name in state.chunks)) return send(404, { status: { error: "Not found" } });
+      return send(200, { result: { status: "green", points_count: state.chunks[name].length } });
+    }
+    if (url.includes("/points/payload")) {
+      const id = body.points[0];
+      state.meta[id] = { ...(state.meta[id] ?? {}), ...body.payload };
+      writeFileSync(stateFile, JSON.stringify(state));
+      return send(200, { result: {} });
+    }
+    if (url.endsWith("/points/scroll")) {
+      const values = isMeta
+        ? Object.values(state.meta)
+        : (state.chunks[name] ?? []).map((p) => ({ relativePath: p }));
+      return send(200, {
+        result: { points: values.map((payload, id) => ({ id, payload })), next_page_offset: null },
+      });
+    }
+    return send(200, {
+      result: body.ids.filter((id) => id in state.meta).map((id) => ({ id, payload: state.meta[id] })),
+    });
+  });
+});
+server.listen(0, "127.0.0.1", () => writeFileSync(portFile, String(server.address().port)));
+`;
+
+interface QdrantState {
+  chunks: Record<string, string[]>;
+  meta: Record<string, Record<string, unknown>>;
+}
+
+describe("verify", () => {
+  const PREFIX = "test_";
+
+  let stateFile: string;
+  let child: ChildProcess | undefined;
+  let qurl: string;
+
+  beforeEach(async () => {
+    stateFile = path.join(home, "qdrant-state.json");
+    const portFile = path.join(home, "qdrant-port");
+    const stub = path.join(home, "qdrant-stub.mjs");
+    writeFileSync(stateFile, JSON.stringify({ chunks: {}, meta: {} }), "utf8");
+    writeFileSync(stub, QDRANT_STUB, "utf8");
+    child = spawn(process.execPath, [stub, stateFile, portFile], { stdio: "ignore" });
+    // Poll the file's *contents*, not its existence: the stub creates it with a
+    // non-atomic write, so the moment it appears it can still be empty — and an
+    // empty read here builds "http://127.0.0.1:" and fails a long way from the
+    // cause.
+    let port = "";
+    for (let i = 0; i < 200 && !port; i++) {
+      try {
+        port = readFileSync(portFile, "utf8").trim();
+      } catch {
+        // Not created yet.
+      }
+      if (!port) await new Promise((r) => setTimeout(r, 20));
+    }
+    if (!port) throw new Error("stub Qdrant never reported a port");
+    qurl = `http://127.0.0.1:${port}`;
+  });
+
+  afterEach(() => {
+    child?.kill();
+    child = undefined;
+  });
+
+  const state = (): QdrantState => JSON.parse(readFileSync(stateFile, "utf8")) as QdrantState;
+  const hashesOf = (id: string): Record<string, string> =>
+    JSON.parse(
+      state().meta[metadataPointId(`${PREFIX}codebase_${id}`)]?.["fileHashes"] as string,
+    ) as Record<string, string>;
+
+  const provider = (): unknown => ({
+    root: home,
+    providers: [
+      {
+        name: "stub",
+        command: "true",
+        args: [],
+        tools: { update: "u" },
+        detectFiles: [".stub.json"],
+        env: { QDRANT_URL: qurl, QDRANT_COLLECTION_PREFIX: PREFIX },
+      },
+    ],
+  });
+
+  /** A claimed repository, with files on disk for the blank-file check. */
+  function repo(name: string, files: Record<string, string> = {}): string {
+    const dir = path.join(home, name);
+    mkdirSync(dir, { recursive: true });
+    execFileSync("git", ["init", "-q", dir], { stdio: "ignore" });
+    writeFileSync(path.join(dir, ".stub.json"), JSON.stringify({ projectId: name }), "utf8");
+    for (const [rel, content] of Object.entries(files)) {
+      writeFileSync(path.join(dir, rel), content, "utf8");
+    }
+    return dir;
+  }
+
+  function seed(
+    id: string,
+    dir: string,
+    claimed: string[],
+    points: string[],
+    indexingStatus = "completed",
+  ): void {
+    const collection = `${PREFIX}codebase_${id}`;
+    const s = state();
+    s.chunks[collection] = points;
+    s.meta[metadataPointId(collection)] = {
+      collectionName: collection,
+      projectPath: dir,
+      filesTotal: claimed.length,
+      filesIndexed: claimed.length,
+      indexingStatus,
+      fileHashes: JSON.stringify(Object.fromEntries(claimed.map((f) => [f, "h"]))),
+    };
+    writeFileSync(stateFile, JSON.stringify(s), "utf8");
+  }
+
+  it("passes an intact index, and says what it counted", () => {
+    writeConfig(provider());
+    const dir = repo("alpha", { "a.ts": "export const a = 1;\n" });
+    seed("alpha", dir, ["a.ts"], ["a.ts"]);
+    const r = cli(["verify", dir]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/1 claimed, 1 with content/);
+  });
+
+  /** The finding this command exists for, and it must fail the run. */
+  it("exits non-zero and names the file when one is claimed but has no chunks", () => {
+    writeConfig(provider());
+    const dir = repo("beta", { "a.ts": "a\n", "lost.ts": "lost\n" });
+    seed("beta", dir, ["a.ts", "lost.ts"], ["a.ts"]);
+    const r = cli(["verify", dir]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/lost\.ts/);
+    // Every failure carries a remedy, and here the remedy is a command.
+    expect(r.out).toMatch(/--repair/);
+  });
+
+  it("does not fail over a blank file, which correctly has no chunks", () => {
+    writeConfig(provider());
+    const dir = repo("gamma", { "a.ts": "a\n", "__init__.py": "" });
+    seed("gamma", dir, ["a.ts", "__init__.py"], ["a.ts"]);
+    const r = cli(["verify", dir]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/1 blank/);
+  });
+
+  it("reports orphaned paths without failing over them", () => {
+    // Stale points make search return something outdated; they do not make it
+    // return nothing, so they are worth knowing and not worth failing on.
+    writeConfig(provider());
+    const dir = repo("delta", { "a.ts": "a\n" });
+    seed("delta", dir, ["a.ts"], ["a.ts", "ghost.ts"]);
+    const r = cli(["verify", dir]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/ghost\.ts/);
+  });
+
+  it("emits the full finding lists as JSON", () => {
+    writeConfig(provider());
+    const dir = repo("epsilon", { "a.ts": "a\n", "lost.ts": "lost\n" });
+    seed("epsilon", dir, ["a.ts", "lost.ts"], ["a.ts"]);
+    const r = cli(["verify", dir, "--json"]);
+    expect(r.code).toBe(1);
+    const parsed = JSON.parse(r.out) as {
+      trackedFiles?: number;
+      reports: { stranded: string[]; claimed: number }[];
+    };
+    expect(parsed.reports[0]?.stranded).toEqual(["lost.ts"]);
+    expect(parsed.reports[0]?.claimed).toBe(2);
+  });
+
+  it("checks every index the backend holds when given no repository", () => {
+    writeConfig(provider());
+    const dir = repo("zeta", { "a.ts": "a\n" });
+    seed("zeta", dir, ["a.ts"], ["a.ts"]);
+    const r = cli(["verify"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/test_codebase_zeta/);
+  });
+
+  it("repairs exactly the stranded entry", () => {
+    writeConfig(provider());
+    const dir = repo("eta", { "a.ts": "a\n", "lost.ts": "lost\n" });
+    seed("eta", dir, ["a.ts", "lost.ts"], ["a.ts"]);
+    const r = cli(["verify", dir, "--repair"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/dropped 1 stranded entry/);
+    expect(hashesOf("eta")).toEqual({ "a.ts": "h" });
+  });
+
+  it("reports a repair as JSON when both flags are given", () => {
+    // A flag the user typed is never silently ignored: --json --repair emits
+    // the reports *and* what the repair did, rather than dropping one of them.
+    writeConfig(provider());
+    const dir = repo("lambda", { "a.ts": "a\n", "lost.ts": "lost\n" });
+    seed("lambda", dir, ["a.ts", "lost.ts"], ["a.ts"]);
+    const r = cli(["verify", dir, "--repair", "--json"]);
+    expect(r.code).toBe(0);
+    const parsed = JSON.parse(r.out) as {
+      reports: { stranded: string[] }[];
+      repair: { removed: string[]; remaining: number; collided: boolean };
+    };
+    expect(parsed.reports[0]?.stranded).toEqual(["lost.ts"]);
+    expect(parsed.repair).toEqual({ removed: ["lost.ts"], remaining: 1, collided: false });
+    expect(hashesOf("lambda")).toEqual({ "a.ts": "h" });
+  });
+
+  it("refuses to repair while an index run is in progress", () => {
+    // Mid-flight, "claimed but no chunks yet" is the normal state of a file
+    // about to be written, not damage.
+    writeConfig(provider());
+    const dir = repo("theta", { "a.ts": "a\n", "pending.ts": "p\n" });
+    seed("theta", dir, ["a.ts", "pending.ts"], ["a.ts"], "in-progress");
+    const r = cli(["verify", dir, "--repair"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/in progress/);
+    expect(Object.keys(hashesOf("theta"))).toHaveLength(2);
+  });
+
+  it("refuses to repair every index at once", () => {
+    writeConfig(provider());
+    const r = cli(["verify", "--repair"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/needs an explicit repository/);
+  });
+
+  it("says which command pins an id when the repo has no marker", () => {
+    writeConfig(provider());
+    const dir = path.join(home, "unclaimed");
+    mkdirSync(dir, { recursive: true });
+    execFileSync("git", ["init", "-q", dir], { stdio: "ignore" });
+    const r = cli(["verify", dir]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/claim/);
+  });
+
+  it("says where the backend URL belongs when none is configured", () => {
+    // The ambient environment is deliberately not a fallback worth relying on:
+    // git hooks never see it, so a config that omits this is broken for the
+    // indexer too.
+    writeConfig({
+      root: home,
+      providers: [
+        { name: "stub", command: "true", args: [], tools: { update: "u" }, detectFiles: [".stub.json"] },
+      ],
+    });
+    const dir = repo("iota");
+    const r = cli(["verify", dir]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/QDRANT_URL/);
+    expect(r.out).toMatch(/env/);
+  });
+
+  it("says nothing has indexed a repo yet rather than reporting damage", () => {
+    writeConfig(provider());
+    const dir = repo("kappa", { "a.ts": "a\n" });
+    const r = cli(["verify", dir]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/no such collection|sync --full/);
   });
 });

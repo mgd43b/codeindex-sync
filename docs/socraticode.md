@@ -229,11 +229,120 @@ codeindex-sync list                # what the backend knows about this repo
 codeindex-sync list --all --stale  # every index, orphans only
 codeindex-sync sync --full         # force a complete reindex
 codeindex-sync log 40 -f           # follow the worker log
+codeindex-sync verify              # is every index intact? (read-only)
 codeindex-sync cleanup             # indexes whose directory is gone (dry run)
 codeindex-sync worktrees --gone    # worktrees whose branch was merged (dry run)
 ```
 
 `cleanup` and `worktrees --gone` are dry runs until you add `--apply`.
+
+## Checking an index is actually intact
+
+Indexing can report success and still lose files. Two failures did exactly that
+here, months apart:
+
+- **A partial write recorded as a success.** Some points never reached Qdrant,
+  the file's content hash was written as current anyway, and no later
+  incremental run revisits a file whose hash already matches. The file is gone
+  from search permanently. Fixed upstream in SocratiCode 1.13.2 — but an index
+  built before that still carries the damage, and does not heal itself.
+- **An interrupted update.** Old chunks are deleted first; if the run dies
+  before the pruned hash map is written, the surviving stale hash suppresses
+  re-indexing of that file forever.
+
+Different causes, one signature: a file the index *claims* to hold, with no
+chunks to its name. That set should always be empty.
+
+```bash
+codeindex-sync verify                # every index, read-only
+codeindex-sync verify ~/code/my-app  # one repo
+```
+
+```
+All indexes
+  ✔ v3_codebase_agentensemble — 3284 points, 1147 claimed, 1147 with content
+  ✘ v3_codebase_my-app — 3 file(s) claimed as indexed with no chunks (9453 points, 671 claimed, 668 with content)
+      → codeindex-sync verify ~/code/my-app --repair, then codeindex-sync sync ~/code/my-app
+      src/api/client.ts
+      src/api/retry.ts
+      src/util/clock.ts
+```
+
+It exits non-zero when it finds a stranded file — that finding only, in both
+terminal and JSON modes — so it works in a cron job or a CI step. Blank files,
+orphaned paths, a collection that does not exist yet and an index with no
+metadata point are all reported without failing the run. It is read-only:
+nothing is written without `--repair`.
+
+### What it compares, and what it deliberately does not
+
+Two sets, both read from the index itself:
+
+- what the hash map on the metadata point **claims** is indexed;
+- the distinct `relativePath` values across the collection's points — what
+  actually **has content**.
+
+It does **not** walk your repository to work out what *should* be indexed. That
+would mean reimplementing SocratiCode's discovery rules — `.gitignore`, nested
+ignores, `.socraticodeignore`, size and language filters, Python environment
+heuristics — and any drift between the two would report files as missing that
+were never meant to be there. A check that cries wolf gets ignored. Claimed
+versus stored cannot drift, because both sides come from the same index.
+
+`git ls-files` is printed alongside as a rough cue and never affects the result,
+for the same reason: the backend indexes a subset of tracked files by rules this
+tool does not model.
+
+### Blank files are not damage
+
+A zero-byte or whitespace-only file is *supposed* to be claimed with no chunks:
+SocratiCode records its hash and emits no chunk, because a chunk with no
+non-whitespace content is worse than none. They are counted separately:
+
+```
+  ✔ v3_codebase_btctrader — 64352 points, 6254 claimed, 6214 with content, 40 blank
+```
+
+Repairing one would never converge — drop the hash, re-index, and it lands
+straight back — so they are named and left alone. An empty `__init__.py` is the
+usual source, and on a Python repo there are dozens.
+
+### Repairing
+
+```bash
+codeindex-sync verify ~/code/my-app --repair
+codeindex-sync sync ~/code/my-app
+```
+
+`--repair` removes the stranded entries from the hash map and changes nothing
+else. That is the whole fix: with the hash gone, the next sync sees those files
+as changed and re-indexes exactly them — no full rebuild, no other file touched.
+
+Three guardrails:
+
+- **It needs an explicit repository.** There is no "repair everything"; a flag
+  that rewrote every index at once is one typo away from a long evening.
+- **It refuses while an index run is in progress.** Mid-flight, "claimed with no
+  chunks yet" is the normal state of a file about to be written.
+- **It re-reads the hash map before writing.** An index run that lands between
+  the check and the repair is not undone.
+
+Points are never deleted. Paths in the index that the hash map does not mention
+are reported as orphaned and left alone: stale content makes search return
+something outdated rather than nothing, and a full reindex (`sync --full`)
+clears it.
+
+### Where it reads from
+
+`verify` is the one command that talks to Qdrant directly rather than through
+MCP, because there is no tool to ask. It takes `QDRANT_URL`, `QDRANT_API_KEY`
+and `QDRANT_COLLECTION_PREFIX` from the provider's `env` block in
+`~/.config/codeindex-sync/config.json` — the same block the indexer is spawned
+with — falling back to the ambient environment only if they are absent there.
+The collection it checks is `<prefix>codebase_<projectId>`, and `projectId`
+comes from the repository's `.socraticode.json`. A repo that pins no id has no
+predictable collection name, so `verify` says to run `claim` rather than
+guessing at one.
 
 ## Repositories that manage their own hooks
 
@@ -275,6 +384,10 @@ reindex clears it: `codeindex-sync sync --full`.
 
 **"another worker is draining".** A previous run died holding the lock:
 `codeindex-sync unlock`. It refuses if the holder is genuinely alive.
+
+**Search stopped finding a file you know is there.** That is the signature of a
+file claimed as indexed with no chunks behind it — `codeindex-sync verify` names
+them, and `--repair` clears the way for the next sync to rebuild exactly those.
 
 **Indexing seems to skip.** `[unchanged]` in the log means HEAD had not moved and
 the tree was clean, so there was nothing to do — usually a hook fired for
