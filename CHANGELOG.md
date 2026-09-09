@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.0](https://github.com/mgd43b/codeindex-sync/compare/v0.1.2...v0.2.0) (2026-09-09)
+
+
+### Features
+
+* add a verify command that checks an index against itself ([#26](https://github.com/mgd43b/codeindex-sync/issues/26)) ([6e7f036](https://github.com/mgd43b/codeindex-sync/commit/6e7f0364d7dde8c0ba51f41cbee682468a1ca5a5))
+
+
+### Bug Fixes
+
+* **verify:** serialise --repair behind the worker lock ([#28](https://github.com/mgd43b/codeindex-sync/issues/28)) ([34bcd85](https://github.com/mgd43b/codeindex-sync/commit/34bcd857c7c0bd288e35d7d709f8ff9cec7c54b5))
+
 ## [0.1.2](https://github.com/mgd43b/codeindex-sync/compare/v0.1.1...v0.1.2) (2026-09-09)
 
 
