@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/mgd43b/codeindex-sync/compare/v0.1.1...v0.1.2) (2026-09-09)
+
+
+### Bug Fixes
+
+* read the version from package.json instead of a hardcoded literal ([#24](https://github.com/mgd43b/codeindex-sync/issues/24)) ([3484ea4](https://github.com/mgd43b/codeindex-sync/commit/3484ea405775d3ca5da87c9f9753705965b10fcc))
+
 ## [0.1.1](https://github.com/mgd43b/codeindex-sync/compare/v0.1.0...v0.1.1) (2026-09-09)
 
 
