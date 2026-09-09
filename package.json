@@ -1,6 +1,6 @@
 {
   "name": "codeindex-sync",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Git-hook-driven index sync for MCP code-search backends such as SocratiCode",
   "type": "module",
   "license": "MIT",
