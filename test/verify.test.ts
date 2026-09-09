@@ -130,6 +130,30 @@ describe("classifyStranded", () => {
     expect(classifyStranded(dir, ["weird"]).stranded).toEqual(["weird"]);
   });
 
+  /**
+   * The hash map is not this tool's own data: it comes out of a store anything
+   * with the API key can write. A key that climbs out of the repository must
+   * not turn into a stat and a read of some unrelated file.
+   */
+  it("refuses a path that climbs out of the project, and calls it damaged", () => {
+    const outside = mkdtempSync(path.join(tmpdir(), "codeindex-outside-"));
+    try {
+      // Blank on disk: if this were read, it would be excused as a blank file.
+      // Seeing it reported as stranded is the evidence it was never opened.
+      writeFileSync(path.join(outside, "secret"), "");
+      const escape = path.relative(dir, path.join(outside, "secret"));
+      expect(classifyStranded(dir, [escape])).toEqual({ stranded: [escape], blank: [] });
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("contains an absolute-looking key inside the project", () => {
+    // path.join treats it as relative, so it lands under the repo and simply
+    // does not exist — damaged, and nothing outside was touched.
+    expect(classifyStranded(dir, ["/etc/passwd"]).stranded).toEqual(["/etc/passwd"]);
+  });
+
   it("keeps everything when there is no tree to check against", () => {
     expect(classifyStranded(undefined, ["a.ts", "b.ts"])).toEqual({
       stranded: ["a.ts", "b.ts"],

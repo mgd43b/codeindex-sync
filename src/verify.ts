@@ -33,6 +33,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import path from "node:path";
+import { isUnder } from "./paths.js";
 import type { Qdrant } from "./qdrant.js";
 
 /** Collection holding one project's chunks. */
@@ -106,6 +107,14 @@ const BLANK_SCAN_LIMIT = 1024 * 1024;
  * infers nothing about which files ought to be indexed. Anything unreadable or
  * absent stays in the damaged set: a hash for a file that is no longer there is
  * exactly the stale entry that suppresses re-indexing.
+ *
+ * Those names are not this tool's own data, though. They come out of a database
+ * that anything holding the API key can write, so a key containing `..` — or a
+ * path whose symlink lands elsewhere — would otherwise have this stat and read
+ * files outside the repository entirely. Anything resolving outside the project
+ * is refused without touching the filesystem and counted as damaged, which is
+ * both the safe answer and the correct one: a blank file *somewhere else* is no
+ * reason to excuse a hash the index cannot account for.
  */
 export function classifyStranded(
   projectPath: string | undefined,
@@ -116,6 +125,10 @@ export function classifyStranded(
   const blank: string[] = [];
   for (const rel of paths) {
     const abs = path.join(projectPath, rel);
+    if (!isUnder(abs, projectPath)) {
+      stranded.push(rel);
+      continue;
+    }
     let isBlank: boolean;
     try {
       const size = statSync(abs).size;
