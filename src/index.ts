@@ -33,3 +33,21 @@ export { buildHookRegistry, buildProviderRegistry } from "./runtime.js";
 export { defaultHooksDir, dispatcherScript, installDispatcher, isOurHooksDir } from "./install.js";
 export { fingerprint, serialiseFingerprint, unchanged } from "./fingerprint.js";
 export type { Fingerprint } from "./fingerprint.js";
+export { Qdrant, QdrantError, resolveQdrantConfig } from "./qdrant.js";
+export type { CollectionInfo, QdrantConfig, ScrollPage } from "./qdrant.js";
+export {
+  classifyStranded,
+  codebaseCollection,
+  compare,
+  metadataPointId,
+  metadataProjects,
+  parseFileHashes,
+  repairCollection,
+  verifyCollection,
+} from "./verify.js";
+export type {
+  MetadataProject,
+  RepairResult,
+  VerifyOptions,
+  VerifyReport,
+} from "./verify.js";

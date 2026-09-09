@@ -37,6 +37,7 @@ import {
   removeWorktree,
   repoRoot,
   setGlobalHooksPath,
+  trackedFileCount,
   unsetGlobalHooksPath,
 } from "./git.js";
 import { isGitHook, type GitHook } from "./hooks.js";
@@ -62,9 +63,18 @@ import {
 } from "./schedule.js";
 import { ProviderRegistry } from "./provider.js";
 import { McpIndexProvider, type McpProviderConfig } from "./providers/mcp-provider.js";
+import { Qdrant, QdrantError, resolveQdrantConfig } from "./qdrant.js";
 import { Queue, nowIso } from "./queue.js";
 import * as ui from "./ui.js";
 import { buildHookRegistry } from "./runtime.js";
+import {
+  codebaseCollection,
+  metadataProjects,
+  repairCollection,
+  verifyCollection,
+  type RepairResult,
+  type VerifyReport,
+} from "./verify.js";
 import { VERSION } from "./version.js";
 import { Worker } from "./worker.js";
 
@@ -412,6 +422,327 @@ program
       ui.warn(
         "an index is incomplete — a previous run was interrupted",
         `only a full reindex clears this: ${ui.style.cyan("codeindex-sync sync --full")}`,
+      );
+    }
+  });
+
+// ── verify ────────────────────────────────────────────────────────────────
+interface VerifyOpts {
+  repair: boolean;
+  json: boolean;
+  provider?: string;
+}
+
+/**
+ * Which provider's store to look in.
+ *
+ * With a repository in hand the marker file already answers this, so only a
+ * genuine ambiguity asks the user — the same rule `claim` follows.
+ */
+function providerToVerify(
+  cfg: Config,
+  wanted: string | undefined,
+  repo: string | undefined,
+): McpProviderConfig {
+  if (wanted) {
+    const found = cfg.providers.find((p) => p.name === wanted);
+    if (!found) {
+      ui.fail(
+        `no configured provider named ${wanted}`,
+        `configured: ${cfg.providers.map((p) => p.name).join(", ")}`,
+      );
+    }
+    return found;
+  }
+  if (repo) {
+    const claiming = cfg.providers.filter((p) =>
+      (p.detectFiles ?? []).some((f) => existsSync(path.join(repo, f))),
+    );
+    if (claiming.length === 1) return claiming[0] as McpProviderConfig;
+    if (claiming.length > 1) {
+      ui.fail(
+        `${claiming.length} providers claim ${repo}`,
+        `pass --provider <${claiming.map((p) => p.name).join("|")}>`,
+      );
+    }
+  }
+  if (cfg.providers.length > 1) {
+    ui.fail(
+      "several providers are configured, so which store to verify is ambiguous",
+      `pass --provider <${cfg.providers.map((p) => p.name).join("|")}>`,
+    );
+  }
+  return cfg.providers[0] as McpProviderConfig;
+}
+
+/**
+ * The project id a repository pins in its marker file.
+ *
+ * This is what names the collection, and it is why `claim` writes the marker
+ * rather than leaving it to chance: without a pinned id the backend derives one
+ * from a hash of the absolute path, which this cannot reproduce and should not
+ * guess at — verifying the wrong collection would report a healthy index as
+ * destroyed.
+ */
+function pinnedProjectId(repo: string, p: McpProviderConfig): string | null {
+  const marker = p.detectFiles?.[0];
+  if (!marker) return null;
+  try {
+    const raw: unknown = JSON.parse(readFileSync(markerPathIn(repo, marker), "utf8"));
+    if (typeof raw !== "object" || raw === null) return null;
+    const id = (raw as Record<string, unknown>)["projectId"];
+    return typeof id === "string" && id ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+function qdrantFor(p: McpProviderConfig): Qdrant {
+  const qc = resolveQdrantConfig(p.env);
+  if (!qc) {
+    ui.fail(
+      `no QDRANT_URL configured for provider ${p.name}`,
+      `add it to that provider's \`env\` block in ${configPath()} — a shell profile is invisible to git hooks, and to this`,
+    );
+  }
+  return new Qdrant(qc);
+}
+
+/** Long finding lists belong in --json; a terminal gets a readable sample. */
+const SAMPLE = 20;
+
+function samples(paths: string[]): void {
+  for (const p of paths.slice(0, SAMPLE)) ui.line(`      ${ui.style.dim(p)}`);
+  if (paths.length > SAMPLE) {
+    ui.line(`      ${ui.style.dim(`… and ${paths.length - SAMPLE} more (--json for all)`)}`);
+  }
+}
+
+/** One report, rendered. */
+function renderReport(r: VerifyReport, repairHint: string): void {
+  if (r.missing === "collection") {
+    ui.warn(
+      `${r.collection} — no such collection`,
+      `nothing has indexed this repository yet: ${ui.style.cyan("codeindex-sync sync --full")}`,
+    );
+    return;
+  }
+  if (r.missing === "metadata") {
+    ui.warn(
+      `${r.collection} — ${r.points} points but no metadata point`,
+      `nothing records what this index claims to hold, so it cannot be checked or updated incrementally: ${ui.style.cyan("codeindex-sync sync --full")}`,
+    );
+    return;
+  }
+
+  const counts = [
+    `${r.points} points`,
+    `${r.claimed} claimed`,
+    `${r.present} with content`,
+    ...(r.blank.length > 0 ? [`${r.blank.length} blank`] : []),
+    // Worth saying out loud: mid-run, "claimed with no chunks yet" is the
+    // normal state of a file about to be written, so any finding below is
+    // provisional until it settles.
+    ...(r.indexingStatus && r.indexingStatus !== "completed" ? [r.indexingStatus] : []),
+  ].join(", ");
+
+  if (r.stranded.length === 0 && r.orphaned.length === 0) {
+    ui.ok(`${r.collection} — ${counts}`);
+    return;
+  }
+
+  if (r.stranded.length > 0) {
+    ui.bad(
+      `${r.collection} — ${r.stranded.length} file(s) claimed as indexed with no chunks (${counts})`,
+      repairHint,
+    );
+    samples(r.stranded);
+  } else {
+    ui.ok(`${r.collection} — ${counts}`);
+  }
+  if (r.orphaned.length > 0) {
+    // Not a failure: extra points are stale rather than missing, so search
+    // returns something outdated instead of nothing. Worth knowing, not worth
+    // failing a check over.
+    ui.warn(
+      `${r.orphaned.length} indexed path(s) the hash map does not mention`,
+      `a full reindex clears these: ${ui.style.cyan("codeindex-sync sync <repo> --full")}`,
+    );
+    samples(r.orphaned);
+  }
+}
+
+program
+  .command("verify [repo]")
+  .description("Check an index against itself: files claimed as indexed, but holding no chunks")
+  .helpGroup(GROUP.diagnostics)
+  .option("--repair", "drop stranded entries so the next sync re-indexes those files", false)
+  .option("--json", "machine-readable output", false)
+  .option("--provider <name>", "which provider's store to check (when several are configured)")
+  .action(async (repo: string | undefined, opts: VerifyOpts) => {
+    const cfg = config();
+    requireProviders(cfg);
+
+    // Repair is per-repository on purpose. It rewrites what an index claims to
+    // hold, and a flag that did that to every project at once is one typo away
+    // from a very long night.
+    if (opts.repair && !repo) {
+      ui.fail(
+        "--repair needs an explicit repository",
+        `name the one to repair, e.g. ${ui.style.cyan("codeindex-sync verify . --repair")}`,
+      );
+    }
+
+    const target = repo === undefined ? undefined : resolveRepo(repo);
+    const provider = providerToVerify(cfg, opts.provider, target);
+    const q = qdrantFor(provider);
+
+    let jobs: { collection: string; projectPath?: string }[];
+    if (target) {
+      const id = pinnedProjectId(target, provider);
+      if (!id) {
+        ui.fail(
+          `${path.basename(target)} pins no project id for ${provider.name}`,
+          `${ui.style.cyan(`codeindex-sync claim ${target}`)} writes the marker that names its index`,
+        );
+      }
+      jobs = [{ collection: codebaseCollection(q.prefix, id), projectPath: target }];
+    } else {
+      try {
+        jobs = (await metadataProjects(q)).map((m) => ({
+          collection: m.collection,
+          ...(m.projectPath === undefined ? {} : { projectPath: m.projectPath }),
+        }));
+      } catch (err) {
+        ui.fail(
+          err instanceof QdrantError ? err.message : String(err),
+          `check that ${q.endpoint} is reachable and the API key in ${configPath()} is current`,
+        );
+      }
+      if (jobs.length === 0) {
+        ui.heading("Verify");
+        ui.empty("no indexes found", "codeindex-sync sync --full");
+        return;
+      }
+    }
+
+    const reports: VerifyReport[] = [];
+    for (const job of jobs) {
+      try {
+        reports.push(
+          await verifyCollection(q, job.collection, {
+            // The tree the caller named wins over the one the metadata
+            // remembers: they differ exactly when an index has been re-pointed
+            // at a worktree, and the caller's is the tree they care about.
+            ...(job.projectPath === undefined ? {} : { projectPath: job.projectPath }),
+          }),
+        );
+      } catch (err) {
+        ui.fail(
+          err instanceof QdrantError ? err.message : String(err),
+          `check that ${q.endpoint} is reachable and the API key in ${configPath()} is current`,
+        );
+      }
+    }
+
+    const tracked = target ? trackedFileCount(target) : null;
+
+    const emitJson = (repair?: RepairResult | { skipped: string }): void => {
+      process.stdout.write(
+        JSON.stringify(
+          {
+            endpoint: q.endpoint,
+            ...(tracked === null ? {} : { trackedFiles: tracked }),
+            reports,
+            ...(repair === undefined ? {} : { repair }),
+          },
+          null,
+          2,
+        ) + "\n",
+      );
+    };
+
+    if (opts.json && !opts.repair) {
+      emitJson();
+      if (reports.some((r) => r.stranded.length > 0)) process.exitCode = 1;
+      return;
+    }
+
+    if (!opts.json) ui.heading(target ? path.basename(target) : "All indexes");
+    let clean = true;
+    for (const r of reports) {
+      if (r.stranded.length > 0) clean = false;
+      if (opts.json) continue;
+      const hint = target
+        ? `${ui.style.cyan(`codeindex-sync verify ${repo} --repair`)}, then ${ui.style.cyan(`codeindex-sync sync ${repo}`)}`
+        : `re-run against that repository with ${ui.style.cyan("--repair")} to fix it`;
+      renderReport(r, hint);
+    }
+
+    const first = reports[0];
+    if (!opts.json && target && first && first.projectPath && path.resolve(first.projectPath) !== target) {
+      // The metadata's own idea of which tree it describes has drifted, which
+      // is what happens when something indexed a linked worktree under this
+      // repository's collection. Reported because the numbers above are about
+      // that other tree, not this one.
+      ui.warn(
+        `the index records its project as ${first.projectPath}`,
+        `re-point it at this checkout: ${ui.style.cyan(`codeindex-sync sync ${repo} --full`)}`,
+      );
+    }
+    if (tracked !== null && !opts.json) {
+      // Informational only, and never part of the verdict: the backend indexes
+      // a subset of tracked files by rules this tool does not model, so any
+      // threshold on this number would be an invention.
+      ui.info(`git tracks ${tracked} files here; the backend indexes a subset of them`);
+    }
+
+    if (!opts.repair) {
+      if (!clean) process.exitCode = 1;
+      return;
+    }
+
+    // ── repair ──
+    const report = reports[0];
+    if (!report || report.stranded.length === 0) {
+      if (opts.json) emitJson({ removed: [], remaining: report?.claimed ?? 0 });
+      else {
+        ui.line();
+        ui.info("nothing to repair");
+      }
+      return;
+    }
+    // Mid-run, a file can be claimed before its chunks land. Rewriting the hash
+    // map then would discard work that is still arriving, so this waits rather
+    // than guessing which findings are real.
+    if (report.indexingStatus === "in-progress") {
+      if (opts.json) emitJson({ skipped: "indexing in progress" });
+      else {
+        ui.line();
+        ui.warn(
+          "an index run is in progress, so this may not be damage at all — skipped",
+          `let it finish, then re-run ${ui.style.cyan(`codeindex-sync verify ${repo}`)}`,
+        );
+      }
+      process.exitCode = 1;
+      return;
+    }
+
+    try {
+      const result = await repairCollection(q, report.collection, report.stranded);
+      if (opts.json) {
+        emitJson(result);
+        return;
+      }
+      ui.line();
+      ui.ok(
+        `dropped ${result.removed.length} stranded entr${result.removed.length === 1 ? "y" : "ies"}; ${result.remaining} left`,
+      );
+      ui.info(`those files re-index on the next sync: ${ui.style.cyan(`codeindex-sync sync ${repo}`)}`);
+    } catch (err) {
+      ui.fail(
+        err instanceof Error ? err.message : String(err),
+        `check that ${q.endpoint} is reachable and the API key in ${configPath()} is current`,
       );
     }
   });
