@@ -64,10 +64,16 @@ function writeConfig(obj: unknown): void {
 }
 
 describe("basics", () => {
-  it("reports its version", () => {
+  it("reports the version from package.json, not a stale literal", () => {
+    // Matching only the shape of a version string is what let the CLI report
+    // 0.1.0 for the whole 0.1.1 release: every hand-edited literal still looks
+    // like a version. Compare the value.
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version: string };
     const r = cli(["--version"]);
     expect(r.code).toBe(0);
-    expect(r.out.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(r.out.trim()).toBe(pkg.version);
   });
 
   it("lists commands in help", () => {

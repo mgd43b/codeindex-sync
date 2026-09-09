@@ -20,6 +20,8 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
+import { VERSION } from "./version.js";
+
 export interface McpToolResult {
   isError: boolean;
   text: string;
@@ -116,7 +118,7 @@ export class McpSession {
     await this.request("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "codeindex-sync", version: "0.1.0" },
+      clientInfo: { name: "codeindex-sync", version: VERSION },
     });
     this.notify("notifications/initialized");
   }

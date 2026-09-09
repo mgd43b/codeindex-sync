@@ -65,9 +65,8 @@ import { McpIndexProvider, type McpProviderConfig } from "./providers/mcp-provid
 import { Queue, nowIso } from "./queue.js";
 import * as ui from "./ui.js";
 import { buildHookRegistry } from "./runtime.js";
+import { VERSION } from "./version.js";
 import { Worker } from "./worker.js";
-
-const VERSION = "0.1.0";
 
 function config(): Config {
   try {
