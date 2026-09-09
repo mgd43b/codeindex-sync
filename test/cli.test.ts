@@ -612,10 +612,10 @@ describe("verify", () => {
     child = undefined;
   });
 
-  const state = (): QdrantState => JSON.parse(readFileSync(stateFile, "utf8")) as QdrantState;
+  const stubState = (): QdrantState => JSON.parse(readFileSync(stateFile, "utf8")) as QdrantState;
   const hashesOf = (id: string): Record<string, string> =>
     JSON.parse(
-      state().meta[metadataPointId(`${PREFIX}codebase_${id}`)]?.["fileHashes"] as string,
+      stubState().meta[metadataPointId(`${PREFIX}codebase_${id}`)]?.["fileHashes"] as string,
     ) as Record<string, string>;
 
   const provider = (): unknown => ({
@@ -652,7 +652,7 @@ describe("verify", () => {
     indexingStatus = "completed",
   ): void {
     const collection = `${PREFIX}codebase_${id}`;
-    const s = state();
+    const s = stubState();
     s.chunks[collection] = points;
     s.meta[metadataPointId(collection)] = {
       collectionName: collection,
@@ -754,6 +754,51 @@ describe("verify", () => {
     expect(parsed.reports[0]?.stranded).toEqual(["lost.ts"]);
     expect(parsed.repair).toEqual({ removed: ["lost.ts"], remaining: 1, collided: false });
     expect(hashesOf("lambda")).toEqual({ "a.ts": "h" });
+  });
+
+  /**
+   * The collision that actually happens: the drain fires on its timer while
+   * someone repairs by hand. Qdrant has no compare-and-swap, so this is
+   * prevented with the worker's own lock rather than detected afterwards.
+   */
+  it("refuses to repair while the worker holds the lock", () => {
+    writeConfig(provider());
+    const dir = repo("mu", { "a.ts": "a\n", "lost.ts": "lost\n" });
+    seed("mu", dir, ["a.ts", "lost.ts"], ["a.ts"]);
+    // This process is unquestionably alive, so the lock reads as genuinely held
+    // rather than as a stale one to reclaim.
+    const lockDir = path.join(state, "worker.lock");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, "pid"), `${process.pid}\n`, "utf8");
+
+    const r = cli(["verify", dir, "--repair"]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/worker is indexing/);
+    expect(Object.keys(hashesOf("mu"))).toHaveLength(2);
+  });
+
+  it("releases the lock after repairing", () => {
+    writeConfig(provider());
+    const dir = repo("nu", { "a.ts": "a\n", "lost.ts": "lost\n" });
+    seed("nu", dir, ["a.ts", "lost.ts"], ["a.ts"]);
+    expect(cli(["verify", dir, "--repair"]).code).toBe(0);
+    expect(hashesOf("nu")).toEqual({ "a.ts": "h" });
+    // A repair that kept the lock would wedge every later drain.
+    expect(existsSync(path.join(state, "worker.lock"))).toBe(false);
+  });
+
+  it("takes no lock for a read-only verify", () => {
+    // Verifying must never block indexing — it is the thing you run on a timer.
+    writeConfig(provider());
+    const dir = repo("xi", { "a.ts": "a\n" });
+    seed("xi", dir, ["a.ts"], ["a.ts"]);
+    const lockDir = path.join(state, "worker.lock");
+    mkdirSync(lockDir, { recursive: true });
+    writeFileSync(path.join(lockDir, "pid"), `${process.pid}\n`, "utf8");
+
+    expect(cli(["verify", dir]).code).toBe(0);
+    // Still held by the "worker": a read-only run neither waits nor releases it.
+    expect(existsSync(path.join(lockDir, "pid"))).toBe(true);
   });
 
   it("refuses to repair while an index run is in progress", () => {

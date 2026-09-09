@@ -318,14 +318,27 @@ codeindex-sync sync ~/code/my-app
 else. That is the whole fix: with the hash gone, the next sync sees those files
 as changed and re-indexes exactly them — no full rebuild, no other file touched.
 
-Three guardrails:
+Four guardrails:
 
 - **It needs an explicit repository.** There is no "repair everything"; a flag
   that rewrote every index at once is one typo away from a long evening.
+- **It takes the worker's lock.** A repair reads the hash map and writes back a
+  derived one, and Qdrant has no compare-and-swap, so the only way to stop a
+  scheduled drain landing in the middle is to stop it running at all. If the
+  worker is busy, the repair says so and does nothing rather than queueing
+  behind it. A read-only `verify` takes no lock and blocks nothing — it is the
+  one you run on a timer.
 - **It refuses while an index run is in progress.** Mid-flight, "claimed with no
-  chunks yet" is the normal state of a file about to be written.
-- **It re-reads the hash map before writing.** An index run that lands between
-  the check and the repair is not undone.
+  chunks yet" is the normal state of a file about to be written. Checked against
+  the metadata point itself, not against a report taken moments earlier.
+- **It re-reads the hash map before writing, and checks it again after.** The
+  lock cannot cover a backend someone runs by hand elsewhere, so a checkpoint
+  that lands anyway is reported instead of passing silently.
+
+If one does land, the damage is bounded and clears itself: the backend
+checkpoints its hash map after every batch, so a collision either drops entries
+it had just added — those files re-index on the next sync — or restores ones it
+had just pruned, which show up as stranded and go on the next repair.
 
 Points are never deleted. Paths in the index that the hash map does not mention
 are reported as orphaned and left alone: stale content makes search return
