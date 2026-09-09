@@ -49,7 +49,7 @@ import {
   repoCoverage,
   uninstallRepoDispatcher,
 } from "./install.js";
-import { WorkerLock, ensureStateDirs } from "./lock.js";
+import { WorkerLock, ensureStateDirs, holderLabel } from "./lock.js";
 import { Logger } from "./logger.js";
 import { isUnder, resolvePaths } from "./paths.js";
 import { PRESETS, findPreset } from "./presets.js";
@@ -650,16 +650,30 @@ program
      * a map that then moves is the very thing being guarded against — and only
      * for `--repair`. A read-only verify takes no lock and blocks nothing.
      */
-    const lock = opts.repair ? new WorkerLock(resolvePaths().lock) : undefined;
+    const paths = resolvePaths();
+    const lock = opts.repair ? new WorkerLock(paths.lock) : undefined;
     if (lock) {
-      // The lock is a directory, and `acquire` deliberately does not create
-      // parents — on a machine where nothing has drained yet, the state
-      // directory does not exist at all and the bare mkdir raises ENOENT.
-      ensureStateDirs([resolvePaths().state]);
-      const got = lock.acquire();
+      let got;
+      try {
+        // The lock is a directory, and `acquire` deliberately does not create
+        // parents — on a machine where nothing has drained yet, the state
+        // directory does not exist at all and the bare mkdir raises ENOENT.
+        ensureStateDirs([paths.state]);
+        got = lock.acquire();
+      } catch (err) {
+        // Taking the lock can fail for reasons that are nothing to do with
+        // contention — an unwritable state directory, a read-only filesystem.
+        // The top-level handler would already keep a stack trace off the
+        // screen, but it has no idea what to suggest, and a diagnosis without
+        // a next step is half a diagnosis.
+        ui.fail(
+          `could not take the worker lock: ${err instanceof Error ? err.message : String(err)}`,
+          `check that ${paths.state} is writable`,
+        );
+      }
       if (!got.acquired) {
         ui.fail(
-          `the worker is indexing right now (pid ${got.heldBy}), and a repair would race it`,
+          `the worker is indexing right now${holderLabel(got.heldBy)}, and a repair would race it`,
           `wait for it to finish — ${ui.style.cyan("codeindex-sync status")} shows when it is idle`,
         );
       }

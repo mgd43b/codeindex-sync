@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { isAlive, WorkerLock } from "../src/lock.js";
+import { holderLabel, isAlive, WorkerLock } from "../src/lock.js";
 
 let dir: string;
 let lockDir: string;
@@ -119,5 +119,23 @@ describe("WorkerLock.forceRelease", () => {
 
   it("is a no-op on an already-unlocked lock", () => {
     expect(new WorkerLock(lockDir).forceRelease(false).released).toBe(true);
+  });
+});
+
+describe("holderLabel", () => {
+  it("names a real holder", () => {
+    expect(holderLabel(4821)).toBe(" (pid 4821)");
+  });
+
+  /**
+   * `acquire` returns -1 when a lock directory raced out from under its reclaim
+   * loop and left nothing readable behind. It cannot be provoked from the CLI
+   * without a real race, which is exactly why the decision lives here as a pure
+   * function rather than inline at the call site: "pid -1" in a user-facing
+   * message reads like a bug in this tool rather than a busy worker.
+   */
+  it("says nothing at all when the holder is unknown", () => {
+    expect(holderLabel(-1)).toBe("");
+    expect(holderLabel(0)).toBe("");
   });
 });

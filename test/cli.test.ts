@@ -6,7 +6,15 @@
  * reads on a failure, and whether a first run teaches or just reports emptiness.
  */
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
@@ -799,6 +807,26 @@ describe("verify", () => {
     expect(cli(["verify", dir]).code).toBe(0);
     // Still held by the "worker": a read-only run neither waits nor releases it.
     expect(existsSync(path.join(lockDir, "pid"))).toBe(true);
+  });
+
+  it("says what to fix when the lock cannot be taken at all", () => {
+    // Contention is only one way this fails. An unwritable state directory is
+    // another, and the top-level handler would print the errno with no idea
+    // what to suggest.
+    writeConfig(provider());
+    const dir = repo("omicron", { "a.ts": "a\n", "lost.ts": "lost\n" });
+    seed("omicron", dir, ["a.ts", "lost.ts"], ["a.ts"]);
+    mkdirSync(state, { recursive: true });
+    chmodSync(state, 0o500);
+    try {
+      const r = cli(["verify", dir, "--repair"]);
+      expect(r.code).toBe(1);
+      expect(r.out).toMatch(/could not take the worker lock/);
+      expect(r.out).toContain(state);
+      expect(Object.keys(hashesOf("omicron"))).toHaveLength(2);
+    } finally {
+      chmodSync(state, 0o700);
+    }
   });
 
   it("refuses to repair while an index run is in progress", () => {
