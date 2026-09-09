@@ -81,7 +81,16 @@ jobs:
           tarball=$(ls codeindex-sync-*.tgz)
           mkdir /tmp/smoke && cd /tmp/smoke && npm init -y >/dev/null
           npm install "$GITHUB_WORKSPACE/$tarball" --silent
-          ./node_modules/.bin/codeindex-sync --version
+          # Assert the value, not just a zero exit: the binary reported a
+          # hardcoded 0.1.0 for the whole 0.1.1 release because running
+          # `--version` succeeded and nobody compared it to anything.
+          want=$(node -p "require('$GITHUB_WORKSPACE/package.json').version")
+          got=$(./node_modules/.bin/codeindex-sync --version)
+          if [ "$got" != "$want" ]; then
+            echo "packed binary reports $got, expected $want" >&2
+            exit 1
+          fi
+          echo "version ok: $got"
           ./node_modules/.bin/codeindex-sync providers --example | node -e 'JSON.parse(require("fs").readFileSync(0));console.log("example config parses")'
 
       # npm's OIDC support is version-gated and fails in a confusing way when
