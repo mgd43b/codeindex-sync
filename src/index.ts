@@ -36,6 +36,7 @@ export type { Fingerprint } from "./fingerprint.js";
 export { Qdrant, QdrantError, resolveQdrantConfig } from "./qdrant.js";
 export type { CollectionInfo, QdrantConfig, ScrollPage } from "./qdrant.js";
 export {
+  RepairRefused,
   classifyStranded,
   codebaseCollection,
   compare,

@@ -53,10 +53,21 @@ export function resolveQdrantConfig(
   const url = pick("QDRANT_URL")?.trim();
   if (!url) return null;
   const apiKey = pick("QDRANT_API_KEY")?.trim();
+  const prefix = pick("QDRANT_COLLECTION_PREFIX") ?? "";
+  // Taken verbatim, and validated rather than tidied. The backend prepends this
+  // to a collection name unchanged and rejects anything outside this character
+  // set at startup, so trimming here would be worse than not: a prefix with a
+  // stray space would pass, name a collection that cannot exist, and the whole
+  // index would read as missing. Rejecting it says what is actually wrong.
+  if (prefix && !/^[A-Za-z0-9_-]+$/.test(prefix)) {
+    throw new QdrantError(
+      `QDRANT_COLLECTION_PREFIX is not a usable collection-name prefix: ${JSON.stringify(prefix)}`,
+    );
+  }
   return {
     url: url.replace(/\/+$/, ""),
     ...(apiKey ? { apiKey } : {}),
-    prefix: pick("QDRANT_COLLECTION_PREFIX") ?? "",
+    prefix,
   };
 }
 

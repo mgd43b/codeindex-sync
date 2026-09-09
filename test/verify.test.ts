@@ -187,6 +187,26 @@ describe("resolveQdrantConfig", () => {
     });
   });
 
+  /**
+   * Not trimmed, and not tidied: the backend prepends this to a collection name
+   * verbatim and rejects the same character set at startup. Quietly accepting a
+   * prefix it would refuse produces a collection name that cannot exist, and
+   * the whole index then reads as missing.
+   */
+  it("rejects a prefix the backend itself would refuse", () => {
+    expect(() => resolveQdrantConfig({ QDRANT_URL: "http://q:6333", QDRANT_COLLECTION_PREFIX: "v3_ " }, {})).toThrow(
+      /QDRANT_COLLECTION_PREFIX/,
+    );
+    expect(() => resolveQdrantConfig({ QDRANT_URL: "http://q:6333", QDRANT_COLLECTION_PREFIX: "a/b" }, {})).toThrow();
+  });
+
+  it("accepts an absent prefix and a valid one", () => {
+    expect(resolveQdrantConfig({ QDRANT_URL: "http://q:6333" }, {})?.prefix).toBe("");
+    expect(
+      resolveQdrantConfig({ QDRANT_URL: "http://q:6333", QDRANT_COLLECTION_PREFIX: "v3_" }, {})?.prefix,
+    ).toBe("v3_");
+  });
+
   it("has no opinion when no URL is configured anywhere", () => {
     expect(resolveQdrantConfig({}, {})).toBeNull();
   });

@@ -15,6 +15,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Qdrant } from "../src/qdrant.js";
 import {
+  RepairRefused,
   metadataPointId,
   metadataProjects,
   repairCollection,
@@ -30,6 +31,8 @@ let chunks: Record<string, string[]>;
 /** Metadata payloads by point id. */
 let meta: Record<string, Record<string, unknown>>;
 let writes: number;
+/** Simulates an index checkpoint landing while a repair is in flight. */
+let bumpOnWrite: boolean;
 let server: Server | undefined;
 let q: Qdrant;
 let dir: string;
@@ -60,6 +63,7 @@ beforeEach(async () => {
   chunks = {};
   meta = {};
   writes = 0;
+  bumpOnWrite = false;
   pageLimit = undefined;
   dir = mkdtempSync(path.join(tmpdir(), "codeindex-verify-coll-"));
 
@@ -84,6 +88,7 @@ beforeEach(async () => {
         const id = (body["points"] as string[])[0] as string;
         writes++;
         meta[id] = { ...(meta[id] ?? {}), ...(body["payload"] as Record<string, unknown>) };
+        if (bumpOnWrite) meta[id] = { ...meta[id], lastIndexedAt: "2026-09-09T13:00:00.000Z" };
         return reply(200, { result: {} });
       }
       if (url.endsWith("/points/scroll")) {
@@ -280,6 +285,45 @@ describe("repairCollection", () => {
       "a.ts": "hash",
       "new.ts": "hash",
     });
+  });
+
+  /**
+   * The window the caller cannot close: a report says "completed", a run starts,
+   * and the repair is issued against a map that is now moving. The status is
+   * therefore re-read here, from the same fetch the map comes from.
+   */
+  it("refuses when a run started between the report and the repair", async () => {
+    seed({ files: { "a.ts": "a\n" }, claimed: ["a.ts", "lost.ts"], points: ["a.ts"] });
+    const before = await verifyCollection(q, COLL);
+    expect(before.stranded).toEqual(["lost.ts"]);
+
+    const id = metadataPointId(COLL);
+    meta[id] = { ...(meta[id] as Record<string, unknown>), indexingStatus: "in-progress" };
+
+    await expect(repairCollection(q, COLL, before.stranded)).rejects.toBeInstanceOf(RepairRefused);
+    expect(writes).toBe(0);
+    // Nothing removed: the map is exactly as the run left it.
+    expect(Object.keys(JSON.parse((meta[id] as Record<string, unknown>)["fileHashes"] as string))).toEqual([
+      "a.ts",
+      "lost.ts",
+    ]);
+  });
+
+  it("reports a checkpoint that landed while the write was in flight", async () => {
+    // Qdrant has no compare-and-swap, so this cannot be prevented — but it can
+    // be noticed, and noticing is what stops a later verify surprising someone.
+    seed({ files: { "a.ts": "a\n" }, claimed: ["a.ts", "lost.ts"], points: ["a.ts"] });
+    const before = await verifyCollection(q, COLL);
+    bumpOnWrite = true;
+    const result = await repairCollection(q, COLL, before.stranded);
+    expect(result.removed).toEqual(["lost.ts"]);
+    expect(result.collided).toBe(true);
+  });
+
+  it("reports no collision on an uncontended repair", async () => {
+    seed({ files: { "a.ts": "a\n" }, claimed: ["a.ts", "lost.ts"], points: ["a.ts"] });
+    const before = await verifyCollection(q, COLL);
+    expect((await repairCollection(q, COLL, before.stranded)).collided).toBe(false);
   });
 
   it("writes nothing when there is nothing to remove", async () => {

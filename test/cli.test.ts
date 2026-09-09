@@ -590,11 +590,21 @@ describe("verify", () => {
     writeFileSync(stateFile, JSON.stringify({ chunks: {}, meta: {} }), "utf8");
     writeFileSync(stub, QDRANT_STUB, "utf8");
     child = spawn(process.execPath, [stub, stateFile, portFile], { stdio: "ignore" });
-    for (let i = 0; i < 200 && !existsSync(portFile); i++) {
-      await new Promise((r) => setTimeout(r, 20));
+    // Poll the file's *contents*, not its existence: the stub creates it with a
+    // non-atomic write, so the moment it appears it can still be empty — and an
+    // empty read here builds "http://127.0.0.1:" and fails a long way from the
+    // cause.
+    let port = "";
+    for (let i = 0; i < 200 && !port; i++) {
+      try {
+        port = readFileSync(portFile, "utf8").trim();
+      } catch {
+        // Not created yet.
+      }
+      if (!port) await new Promise((r) => setTimeout(r, 20));
     }
-    if (!existsSync(portFile)) throw new Error("stub Qdrant never came up");
-    qurl = `http://127.0.0.1:${readFileSync(portFile, "utf8").trim()}`;
+    if (!port) throw new Error("stub Qdrant never reported a port");
+    qurl = `http://127.0.0.1:${port}`;
   });
 
   afterEach(() => {
@@ -739,10 +749,10 @@ describe("verify", () => {
     expect(r.code).toBe(0);
     const parsed = JSON.parse(r.out) as {
       reports: { stranded: string[] }[];
-      repair: { removed: string[]; remaining: number };
+      repair: { removed: string[]; remaining: number; collided: boolean };
     };
     expect(parsed.reports[0]?.stranded).toEqual(["lost.ts"]);
-    expect(parsed.repair).toEqual({ removed: ["lost.ts"], remaining: 1 });
+    expect(parsed.repair).toEqual({ removed: ["lost.ts"], remaining: 1, collided: false });
     expect(hashesOf("lambda")).toEqual({ "a.ts": "h" });
   });
 

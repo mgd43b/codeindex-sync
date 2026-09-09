@@ -268,8 +268,11 @@ All indexes
       src/util/clock.ts
 ```
 
-It exits non-zero when it finds any, so it works in a cron job or CI step. It is
-read-only: nothing is written without `--repair`.
+It exits non-zero when it finds a stranded file — that finding only, in both
+terminal and JSON modes — so it works in a cron job or a CI step. Blank files,
+orphaned paths, a collection that does not exist yet and an index with no
+metadata point are all reported without failing the run. It is read-only:
+nothing is written without `--repair`.
 
 ### What it compares, and what it deliberately does not
 

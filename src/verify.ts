@@ -239,6 +239,25 @@ export interface RepairResult {
   removed: string[];
   /** Keys left in the hash map afterwards. */
   remaining: number;
+  /**
+   * An index run wrote the metadata point while this repair was in flight, so
+   * some of what it recorded may have been written over. Bounded and
+   * self-correcting — see `repairCollection`.
+   */
+  collided: boolean;
+}
+
+/**
+ * Repair declined because writing now could discard work that is arriving.
+ *
+ * Its own type rather than a message to match on: the caller answers this with
+ * "wait and re-run", which is nothing like the answer to an unreachable store.
+ */
+export class RepairRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RepairRefused";
+  }
 }
 
 /**
@@ -253,6 +272,26 @@ export interface RepairResult {
  * Only the hash map and the count derived from it are written. `filesTotal` is
  * the backend's own walk count and is not ours to invent; leaving `filesIndexed`
  * stale would break the backend's invariant that it equals the map's size.
+ *
+ * ## Racing an index run
+ *
+ * Qdrant has no compare-and-swap: `set_payload` takes no version precondition
+ * and simply ignores one, so this read-modify-write cannot be made atomic. Two
+ * things make that acceptable rather than merely unavoidable.
+ *
+ * First, the window is narrowed at both ends. The status is re-read here, from
+ * the same fetch the map comes from, rather than trusted from a report taken
+ * seconds earlier — a run that started in between is refused outright. Then the
+ * point is read again after the write, and a `lastIndexedAt` that moved says a
+ * checkpoint landed inside the window even so.
+ *
+ * Second, the worst case is bounded and self-correcting. The backend checkpoints
+ * its hash map after every batch, so a collision either drops keys it had just
+ * added — those files are re-indexed on the next sync, costing work rather than
+ * data — or restores keys it had just pruned, which reappear as stranded and are
+ * cleared by the next repair. Neither deletes a point or damages the index. That
+ * is why this reports a collision rather than locking against one: a lock spanning
+ * a full reindex is a far worse thing to own than a redundant batch.
  */
 export async function repairCollection(
   q: Qdrant,
@@ -267,18 +306,32 @@ export async function repairCollection(
   if (!hashes) {
     throw new Error(`no metadata point for ${collection}; nothing to repair`);
   }
+  // Checked here and not only by the caller: a run can start between a report
+  // and the repair it prompted, and this is the last look before writing.
+  if (meta?.["indexingStatus"] === "in-progress") {
+    throw new RepairRefused(
+      `an index run is in progress for ${collection}; nothing was written`,
+    );
+  }
+  const before = meta?.["lastIndexedAt"];
+
   const removed: string[] = [];
   for (const key of stranded) {
     if (hashes.delete(key)) removed.push(key);
   }
-  if (removed.length > 0) {
-    const payload: Record<string, unknown> = {
-      fileHashes: JSON.stringify(Object.fromEntries(hashes)),
-    };
-    if (typeof meta?.["filesIndexed"] === "number") payload["filesIndexed"] = hashes.size;
-    await q.setPayload(q.metadataCollection, id, payload);
-  }
-  return { removed, remaining: hashes.size };
+  if (removed.length === 0) return { removed, remaining: hashes.size, collided: false };
+
+  const payload: Record<string, unknown> = {
+    fileHashes: JSON.stringify(Object.fromEntries(hashes)),
+  };
+  if (typeof meta?.["filesIndexed"] === "number") payload["filesIndexed"] = hashes.size;
+  await q.setPayload(q.metadataCollection, id, payload);
+
+  // The backend stamps lastIndexedAt on every checkpoint, so a value that moved
+  // between the read above and this one means a batch landed inside the window.
+  const after = await q.point(q.metadataCollection, id);
+  const collided = before !== undefined && after?.["lastIndexedAt"] !== before;
+  return { removed, remaining: hashes.size, collided };
 }
 
 /** One project the backend's metadata knows about. */

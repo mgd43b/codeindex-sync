@@ -68,6 +68,7 @@ import { Queue, nowIso } from "./queue.js";
 import * as ui from "./ui.js";
 import { buildHookRegistry } from "./runtime.js";
 import {
+  RepairRefused,
   codebaseCollection,
   metadataProjects,
   repairCollection,
@@ -498,7 +499,15 @@ function pinnedProjectId(repo: string, p: McpProviderConfig): string | null {
 }
 
 function qdrantFor(p: McpProviderConfig): Qdrant {
-  const qc = resolveQdrantConfig(p.env);
+  let qc;
+  try {
+    qc = resolveQdrantConfig(p.env);
+  } catch (err) {
+    ui.fail(
+      err instanceof Error ? err.message : String(err),
+      `fix it in that provider's \`env\` block in ${configPath()} — the backend rejects the same value, so indexing is broken too`,
+    );
+  }
   if (!qc) {
     ui.fail(
       `no QDRANT_URL configured for provider ${p.name}`,
@@ -705,7 +714,7 @@ program
     // ── repair ──
     const report = reports[0];
     if (!report || report.stranded.length === 0) {
-      if (opts.json) emitJson({ removed: [], remaining: report?.claimed ?? 0 });
+      if (opts.json) emitJson({ removed: [], remaining: report?.claimed ?? 0, collided: false });
       else {
         ui.line();
         ui.info("nothing to repair");
@@ -738,8 +747,25 @@ program
       ui.ok(
         `dropped ${result.removed.length} stranded entr${result.removed.length === 1 ? "y" : "ies"}; ${result.remaining} left`,
       );
+      if (result.collided) {
+        // Bounded and self-correcting, but the user should not learn about it
+        // from a second verify reporting something new.
+        ui.warn(
+          "an index run wrote this index while the repair was in flight",
+          `re-run ${ui.style.cyan(`codeindex-sync verify ${repo}`)} once it settles`,
+        );
+      }
       ui.info(`those files re-index on the next sync: ${ui.style.cyan(`codeindex-sync sync ${repo}`)}`);
     } catch (err) {
+      if (err instanceof RepairRefused) {
+        ui.line();
+        ui.warn(
+          err.message,
+          `let it finish, then re-run ${ui.style.cyan(`codeindex-sync verify ${repo}`)}`,
+        );
+        process.exitCode = 1;
+        return;
+      }
       ui.fail(
         err instanceof Error ? err.message : String(err),
         `check that ${q.endpoint} is reachable and the API key in ${configPath()} is current`,
