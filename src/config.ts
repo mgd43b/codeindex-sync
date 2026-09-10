@@ -103,7 +103,19 @@ function validateProvider(p: unknown, index: number): McpProviderConfig {
   };
   if (typeof o["description"] === "string") cfg.description = o["description"];
   if (typeof o["repoArg"] === "string") cfg.repoArg = o["repoArg"];
-  if (Array.isArray(o["detectFiles"])) cfg.detectFiles = o["detectFiles"] as string[];
+  if (Array.isArray(o["detectFiles"])) {
+    // Every entry, not just the array: these become `path.join(dir, entry)` in
+    // the hook path, where a number throws a TypeError *inside the user's git
+    // command*. Rejecting it at load turns that into one clear config error.
+    const bad = o["detectFiles"].findIndex((f) => typeof f !== "string" || f === "");
+    if (bad !== -1) {
+      throw new ConfigError(
+        `${where}.detectFiles[${bad}] is not a filename`,
+        `each entry is a marker file name, e.g. "detectFiles": [".socraticode.json"]`,
+      );
+    }
+    cfg.detectFiles = o["detectFiles"] as string[];
+  }
   if (typeof o["markerContent"] === "string") cfg.markerContent = o["markerContent"];
   if (Array.isArray(o["busyMarkers"])) cfg.busyMarkers = o["busyMarkers"] as string[];
   if (Array.isArray(o["asyncIndexMarkers"])) {

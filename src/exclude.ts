@@ -62,12 +62,16 @@ export function patternSegments(pattern: string): string[] {
  * Segments using glob syntax this matcher does not implement.
  *
  * `**` is the only wildcard, and only as a whole segment. Anything else — `*`,
- * `?`, a character class — would be taken literally and match nothing, so a
- * pattern meant to exclude a directory would silently do nothing at all. The
- * config layer turns this into an error at load; see `parseExcludePaths`.
+ * `?`, a character class, a brace list — would be taken literally and match
+ * nothing, so a pattern meant to exclude a directory would silently do nothing at
+ * all. The config layer turns this into an error at load; see `parseExcludePaths`.
+ *
+ * Only the metacharacters that are practically never real directory names are
+ * refused. `!`, `+`, `@` and parentheses are ordinary characters far more often
+ * than they are extglob, and refusing them would reject a legitimate exclusion.
  */
 export function unsupportedGlobSegments(pattern: string): string[] {
-  return pattern.split(/[\\/]+/).filter((s) => s !== "**" && /[*?[\]]/.test(s));
+  return pattern.split(/[\\/]+/).filter((s) => s !== "**" && /[*?[\]{}]/.test(s));
 }
 
 function containsRun(segments: readonly string[], want: readonly string[]): boolean {
@@ -141,9 +145,10 @@ function projectRoot(dir: string, repo: string, markers: readonly string[]): str
   const root = realPath(repo);
   if (markers.length === 0) return root;
   let cur = realPath(dir);
-  // The walk cannot run away up to `/`: `isUnder` resolves both sides, and both
-  // are resolved already. The iteration cap is belt-and-braces.
-  for (let i = 0; i < 64 && isUnder(cur, root); i++) {
+  // Bounded without a counter: both paths are resolved, so the walk either
+  // reaches `root` or leaves it — and `parent === cur` catches the filesystem
+  // root. A depth cap would only ever mean "gave up and widened", silently.
+  while (isUnder(cur, root)) {
     if (markers.some((m) => existsSync(path.join(cur, m)))) return cur;
     const parent = path.dirname(cur);
     if (parent === cur) break;

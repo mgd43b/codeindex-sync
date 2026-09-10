@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -37,7 +37,7 @@ afterEach(() => {
 describe("repoRoot", () => {
   it("finds the root from a subdirectory", () => {
     const sub = path.join(dir, "nested", "deep");
-    execFileSync("mkdir", ["-p", sub]);
+    mkdirSync(sub, { recursive: true });
     expect(repoRoot(sub)).toBe(repoRoot(dir));
   });
 
@@ -76,7 +76,7 @@ describe("isLinkedWorktree", () => {
     // The /repo/src trap: a project can be legitimately rooted here, and the
     // tempting `dir !== mainWorktree(dir)` test calls this a worktree.
     const sub = path.join(dir, "nested", "deep");
-    execFileSync("mkdir", ["-p", sub]);
+    mkdirSync(sub, { recursive: true });
     expect(isLinkedWorktree(sub)).toBe(false);
   });
 
@@ -84,7 +84,7 @@ describe("isLinkedWorktree", () => {
     const wt = path.join(dir, "..", `wt-linked-${path.basename(dir)}`);
     run(["worktree", "add", "-q", "-b", "linked", wt]);
     const sub = path.join(wt, "sub");
-    execFileSync("mkdir", ["-p", sub]);
+    mkdirSync(sub, { recursive: true });
     expect(isLinkedWorktree(wt)).toBe(true);
     expect(isLinkedWorktree(sub)).toBe(true);
     rmSync(wt, { recursive: true, force: true });

@@ -169,6 +169,18 @@ describe("ordinary checkouts", () => {
     expect(pathOf(d)).not.toBe(real);
   });
 
+  it("finds the enclosing project however far above the hook's cwd it sits", () => {
+    // The walk is bounded by the repository root, not by a depth counter: a
+    // counter would give up on a deep tree and silently widen to the whole repo.
+    const nested = Array.from({ length: 70 }, (_, i) => `d${i}`);
+    const project = path.join(dir, "sub-project");
+    const deep = path.join(project, ...nested);
+    mkdirSync(deep, { recursive: true });
+    claim(project);
+
+    expect(pathOf(decide(deep))).toBe(path.join(real, "sub-project"));
+  });
+
   it("widens an unmarked subdirectory to the repository root", () => {
     // The other half of the same rule: with no project of its own, a
     // subdirectory belongs to the repository, which is where git runs hooks.
@@ -229,6 +241,11 @@ describe("matchesExcludePath", () => {
   it("names the glob syntax it does not implement", () => {
     // Config refuses these at load; here is the reason it has to.
     expect(unsupportedGlobSegments("**/.claude/*/**")).toEqual(["*"]);
+    expect(unsupportedGlobSegments("**/{.claude,.codex}/worktrees/**")).toEqual([
+      "{.claude,.codex}",
+    ]);
+    // Characters that are ordinary in a directory name stay allowed.
+    expect(unsupportedGlobSegments("**/build (old)/**")).toEqual([]);
     expect(unsupportedGlobSegments("**/.claude/worktrees/**")).toEqual([]);
     expect(unsupportedGlobSegments(".claude/worktrees")).toEqual([]);
   });

@@ -104,6 +104,23 @@ describe("parseConfig", () => {
     expect(cfg.providers[0]?.pollIntervalMs).toBe(500);
   });
 
+  it("rejects a detectFiles entry that is not a filename", () => {
+    // These become `path.join(dir, entry)` inside a git hook, where a number
+    // throws a TypeError in the middle of the user's commit.
+    try {
+      parseConfig(
+        JSON.stringify({
+          providers: [{ name: "x", command: "c", tools: { update: "u" }, detectFiles: [42] }],
+        }),
+      );
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).message).toContain("detectFiles[0]");
+      expect((err as ConfigError).remedy).toContain("detectFiles");
+    }
+  });
+
   it("keeps optional fields when present", () => {
     const cfg = parseConfig(
       JSON.stringify({
@@ -174,6 +191,16 @@ describe("excludePaths", () => {
       expect(err).toBeInstanceOf(ConfigError);
       expect((err as ConfigError).message).toContain("not implemented");
       expect((err as ConfigError).remedy).toContain("whole segment");
+    }
+  });
+
+  it("rejects a brace list, which would also match nothing", () => {
+    try {
+      parseConfig(JSON.stringify({ excludePaths: ["**/{.claude,.codex}/worktrees/**"] }));
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).message).toContain("not implemented");
     }
   });
 
