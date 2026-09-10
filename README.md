@@ -135,10 +135,13 @@ in the worker, the abstraction has leaked.
   Agent tools are also excluded by path — `excludePaths`, defaulting to
   `**/.claude/worktrees/**` and `**/.codex/worktrees/**` — because a deleted
   directory is the normal case by the time a hook runs, and git can answer
-  nothing about one. Neither rule asks "is this the repository root?": a project
-  legitimately rooted at `/repo/src` must be indexed as `/repo/src`, not
-  discarded and not widened to the whole repo. Add a directory to
-  `excludePaths` when a new tool appears; no release needed.
+  nothing about one. Neither rule asks "is this the repository root?": a path
+  handed over as `/repo/src` — a nested project, a manual `sync` — must come back
+  as `/repo/src`, neither discarded as a worktree nor widened to the whole repo.
+  (Git fires these hooks at the working-tree root, so a nested project under an
+  unmarked root is still reached by `sync`, not by a commit; finding it from the
+  root would mean a tree walk on every commit.) Add a directory to `excludePaths`
+  when a new tool appears; no release needed.
 - **The log is the diagnostic.** Append-only, rotated not truncated, and writing
   to it never throws.
 - **`verify` is the one deliberate exception.** Every other command drives a

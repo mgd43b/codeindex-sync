@@ -181,6 +181,20 @@ describe("ordinary checkouts", () => {
     expect(pathOf(decide(deep))).toBe(path.join(real, "sub-project"));
   });
 
+  it("does not go looking for a nested project below an unmarked root", () => {
+    // The documented limit. Git fires post-* hooks at the working-tree root, and
+    // finding this marker from there would mean scanning downwards — a tree walk
+    // on every commit. `sync /repo/src` is the route; that predates this guard.
+    const sub = path.join(dir, "nested-project");
+    mkdirSync(sub);
+    claim(sub);
+    rmSync(path.join(dir, ".socraticode.json"));
+
+    expect(pathOf(decide(dir))).toBe(real);
+    // Handed the subdirectory directly, it still comes back untouched.
+    expect(pathOf(decide(sub))).toBe(path.join(real, "nested-project"));
+  });
+
   it("widens an unmarked subdirectory to the repository root", () => {
     // The other half of the same rule: with no project of its own, a
     // subdirectory belongs to the repository, which is where git runs hooks.

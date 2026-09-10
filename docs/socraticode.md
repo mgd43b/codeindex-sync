@@ -258,10 +258,13 @@ The list is config, so the next tool is an edit rather than a release:
 }
 ```
 
-Patterns are runs of path segments; `**` is accepted and ignored, and no other
-glob syntax is implemented. `[]` excludes nothing. `codeindex-sync doctor` prints
-the list, which is the quickest answer to "why was this repository never
-indexed?"
+Patterns are runs of path segments; `**` is accepted and ignored. No other glob
+syntax is implemented, and rather than let such a pattern sit there matching
+nothing, the config is **refused at load**: a segment containing `*`, `?`, `[`,
+`]`, `{` or `}` is an error, as is a pattern naming no directory at all — that one
+would exclude every repository on the machine. `[]` excludes nothing.
+`codeindex-sync doctor` prints the list, which is the quickest answer to "why was
+this repository never indexed?"
 
 ## Checking an index is actually intact
 

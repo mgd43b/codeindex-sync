@@ -132,10 +132,17 @@ export interface ResolveTargetOptions {
 /**
  * Nearest enclosing directory a provider would claim, else the repository root.
  *
- * Walking up rather than down: a marked directory *above* the hook's cwd is the
- * project, and scanning downwards would be a tree walk in a git hook. With no
- * marker anywhere the answer is the repository root, which is where git runs
- * hooks and what every existing config already describes.
+ * Upward only, and the limit of that is worth stating: git runs the post-* hooks
+ * with the working tree's ROOT as their cwd, so in the ordinary case there is
+ * nothing above to find and the answer is the repository root. What this walk
+ * buys is that a caller handing over a subdirectory — a nested project, a manual
+ * `sync /repo/src` — gets that directory back rather than the whole repository.
+ *
+ * A project rooted at /repo/src whose repository root carries no marker is
+ * therefore still not discovered from a hook firing at /repo. Finding it would
+ * mean scanning downwards, which in a git hook is a tree walk on every commit;
+ * `sync /repo/src` indexes it instead. That is unchanged by this guard, which is
+ * only ever allowed to skip or to pass a path through untouched.
  */
 function projectRoot(dir: string, repo: string, markers: readonly string[]): string {
   // One spelling per directory, always the resolved one. git answers with
