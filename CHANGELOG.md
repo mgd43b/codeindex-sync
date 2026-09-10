@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/mgd43b/codeindex-sync/compare/v0.2.0...v0.3.0) (2026-09-10)
+
+
+### Features
+
+* never index a worktree, and make the excluded paths config ([#31](https://github.com/mgd43b/codeindex-sync/issues/31)) ([6a78dcd](https://github.com/mgd43b/codeindex-sync/commit/6a78dcd0f6ccdaa553c83dbee028e54d4fda6149))
+
 ## [0.2.0](https://github.com/mgd43b/codeindex-sync/compare/v0.1.2...v0.2.0) (2026-09-09)
 
 
