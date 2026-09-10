@@ -49,6 +49,7 @@ behaviour here comes from a failure seen in production:
 |---|---|
 | **Bursts** | One `git rebase` fires dozens of hooks; naive tools run dozens of concurrent indexers against one GPU |
 | **Throwaway worktrees** | A hook fires from a directory that has since been deleted; the indexer dies during interpreter startup with an opaque error |
+| **Agent worktrees** | Every coding agent checks the repo out under its own directory and commits there. Each copy carries the committed marker file, so the backend builds a second index of the same code — under a path that will not exist in an hour |
 | **Redundant work** | Worktree churn re-queues the same repo repeatedly, each costing a full tree walk to conclude nothing changed |
 | **Crashes** | A worker that dies mid-job silently drops that repository forever |
 | **Backend contention** | The backend's own lock is misread as failure, parking healthy repos in `failed/` |
@@ -129,6 +130,15 @@ in the worker, the abstraction has leaked.
   this catches recovered and retried jobs. A real change can never be dropped,
   because its hook fires only after the file changed.
 - **`busy` is not failure.** Contention requeues without burning an attempt.
+- **Worktrees are not projects.** A commit in a linked worktree changes no file
+  in the checkout that carries the index, so hooks firing there enqueue nothing.
+  Agent tools are also excluded by path — `excludePaths`, defaulting to
+  `**/.claude/worktrees/**` and `**/.codex/worktrees/**` — because a deleted
+  directory is the normal case by the time a hook runs, and git can answer
+  nothing about one. Neither rule asks "is this the repository root?": a project
+  legitimately rooted at `/repo/src` must be indexed as `/repo/src`, not
+  discarded and not widened to the whole repo. Add a directory to
+  `excludePaths` when a new tool appears; no release needed.
 - **The log is the diagnostic.** Append-only, rotated not truncated, and writing
   to it never throws.
 - **`verify` is the one deliberate exception.** Every other command drives a

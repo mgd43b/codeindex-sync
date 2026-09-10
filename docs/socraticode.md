@@ -236,6 +236,33 @@ codeindex-sync worktrees --gone    # worktrees whose branch was merged (dry run)
 
 `cleanup` and `worktrees --gone` are dry runs until you add `--apply`.
 
+## Worktrees, and the agent tools that make them
+
+Nothing indexes a worktree. A commit in a linked worktree changes no file in the
+checkout that holds the index, so a hook firing there enqueues nothing at all —
+and the worktree's own path is never indexed, which is what would otherwise give
+you two collections for one repository.
+
+Agent tools get a second, blunter rule. They check the repo out under their own
+directory — `.claude/worktrees/`, `.codex/worktrees/` — and each copy carries
+your committed `.socraticode.json`, so nothing about it looks unusual to the
+backend. Those paths are excluded by name, because by the time a `post-commit`
+hook runs the directory has often already been deleted, and git can then answer
+nothing about it. The path is still the path.
+
+The list is config, so the next tool is an edit rather than a release:
+
+```json
+{
+  "excludePaths": ["**/.claude/worktrees/**", "**/.codex/worktrees/**"]
+}
+```
+
+Patterns are runs of path segments; `**` is accepted and ignored, and no other
+glob syntax is implemented. `[]` excludes nothing. `codeindex-sync doctor` prints
+the list, which is the quickest answer to "why was this repository never
+indexed?"
+
 ## Checking an index is actually intact
 
 Indexing can report success and still lose files. Two failures did exactly that

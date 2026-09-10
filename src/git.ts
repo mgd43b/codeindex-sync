@@ -60,6 +60,28 @@ export function mainWorktree(dir: string): string | null {
   return common.replace(/\/\.git\/?$/, "") || null;
 }
 
+/**
+ * Is `dir` inside a LINKED worktree rather than the main checkout?
+ *
+ * `null` means git could not say — not a repository, or the directory is gone,
+ * which for a throwaway worktree is the normal case by the time anything runs.
+ * Callers must read null as "don't know", never as "yes".
+ *
+ * The test is the worktree's own git dir against the shared one, because that is
+ * the only thing which separates the two cases that matter. Comparing `dir` with
+ * `mainWorktree(dir)` looks equivalent and is not: it also answers "linked" for
+ * an ordinary subdirectory of the main checkout, so a project legitimately
+ * rooted at /repo/src would be discarded as a worktree — and "fixing" that by
+ * widening to the repository root indexes the wrong tree instead.
+ */
+export function isLinkedWorktree(dir: string): boolean | null {
+  // One spawn, not two: this runs inside the user's git commands.
+  const out = git(["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"], dir);
+  const [gitDir, common] = (out ?? "").split("\n").map((l) => l.trim());
+  if (!gitDir || !common) return null;
+  return path.resolve(gitDir) !== path.resolve(common);
+}
+
 export interface Worktree {
   path: string;
   branch: string | null;

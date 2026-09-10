@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ConfigError, DEFAULT_CONFIG, loadConfig, parseConfig, saveConfig } from "../src/config.js";
+import { DEFAULT_EXCLUDE_PATHS } from "../src/exclude.js";
 import { PRESETS, findPreset } from "../src/presets.js";
 
 let dir: string;
@@ -123,6 +124,76 @@ describe("parseConfig", () => {
     expect(p?.detectFiles).toEqual([".marker"]);
     expect(p?.timeoutMs).toBe(1234);
     expect(p?.env).toEqual({ FOO: "bar" });
+  });
+});
+
+describe("excludePaths", () => {
+  it("defaults to the agent tools that exist today", () => {
+    // Both of them: hard-coding one tool's directory is how the next tool's
+    // worktrees end up indexed.
+    const cfg = parseConfig("{}");
+    expect(cfg.excludePaths).toContain("**/.claude/worktrees/**");
+    expect(cfg.excludePaths).toContain("**/.codex/worktrees/**");
+  });
+
+  it("is a config value, so a new tool needs no release", () => {
+    const cfg = parseConfig(JSON.stringify({ excludePaths: ["**/.newtool/trees/**"] }));
+    expect(cfg.excludePaths).toEqual(["**/.newtool/trees/**"]);
+  });
+
+  it("accepts an empty list, which excludes nothing", () => {
+    expect(parseConfig(JSON.stringify({ excludePaths: [] })).excludePaths).toEqual([]);
+  });
+
+  it("survives a save/load round trip", () => {
+    const file = path.join(dir, "config.json");
+    saveConfig({ ...DEFAULT_CONFIG, excludePaths: ["**/.tool/wt/**"] }, file);
+    expect(loadConfig(file).excludePaths).toEqual(["**/.tool/wt/**"]);
+  });
+
+  it("rejects a pattern that would exclude every repository", () => {
+    // The symptom of this one is "nothing is ever indexed again", which looks
+    // exactly like broken hooks. It has to fail at load, with a reason.
+    try {
+      parseConfig(JSON.stringify({ excludePaths: ["**/.claude/worktrees/**", "**"] }));
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).message).toContain("excludePaths[1]");
+      expect((err as ConfigError).remedy).toContain(DEFAULT_EXCLUDE_PATHS[0] as string);
+    }
+  });
+
+  it("rejects glob syntax it does not implement, rather than matching nothing", () => {
+    // `*` is taken literally, so this pattern would exclude nothing while
+    // looking exactly like a pattern that works.
+    try {
+      parseConfig(JSON.stringify({ excludePaths: ["**/.claude/*/**"] }));
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).message).toContain("not implemented");
+      expect((err as ConfigError).remedy).toContain("whole segment");
+    }
+  });
+
+  it("rejects a non-array and says what one looks like", () => {
+    try {
+      parseConfig(JSON.stringify({ excludePaths: ".claude/worktrees" }));
+      expect.unreachable();
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).remedy).toContain(".claude/worktrees");
+    }
+  });
+
+  it("rejects a non-string entry, naming the offending index", () => {
+    try {
+      parseConfig(JSON.stringify({ excludePaths: [42] }));
+      expect.unreachable();
+    } catch (err) {
+      expect((err as ConfigError).message).toContain("excludePaths[0]");
+    }
   });
 });
 

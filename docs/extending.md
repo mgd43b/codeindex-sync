@@ -207,7 +207,7 @@ const lintCache: HookHandler = {
   description: "Warm the lint cache after a checkout",
   hooks: ["post-checkout", "post-merge"],
   async handle(event) {
-    // event.repoPath is the MAIN worktree, already resolved
+    // event.repoPath is the project root, already resolved
     // event.hook, event.args, event.at
   },
 };
@@ -225,7 +225,16 @@ can fire dozens of events. Enqueue work; don't do it inline.
 **Use `event.repoPath`, never `process.cwd()`.** The hook's working directory is
 frequently a throwaway worktree that no longer exists by the time you run — and
 a deleted cwd kills the process during interpreter startup, before your code
-runs at all. `repoPath` is already resolved to the main worktree.
+runs at all. `repoPath` is already resolved: the nearest enclosing directory a
+configured provider claims, else the repository root.
+
+**Some hooks never reach you, deliberately.** A hook firing in a linked worktree,
+or in a directory matching `excludePaths` (agent tools: `.claude/worktrees/`,
+`.codex/worktrees/`), is dropped before dispatch — no handler is called. Those
+commits change no file in the checkout that carries the index, and the directory
+is usually gone seconds later. If your handler genuinely wants worktree events,
+say so on an issue; nothing about the design forbids it, but the guard is
+currently before the registry rather than inside it.
 
 **Throwing is contained but not free.** A handler that throws is reported and the
 others still run — a broken extension must never break `git commit`. But a slow
