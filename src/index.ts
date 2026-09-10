@@ -24,6 +24,14 @@ export { resolvePaths } from "./paths.js";
 export type { Paths } from "./paths.js";
 export { ConfigError, DEFAULT_CONFIG, loadConfig, parseConfig, saveConfig } from "./config.js";
 export type { Config } from "./config.js";
+export {
+  DEFAULT_EXCLUDE_PATHS,
+  matchesExcludePath,
+  patternSegments,
+  resolveHookTarget,
+  unsupportedGlobSegments,
+} from "./exclude.js";
+export type { HookDecision, HookSkip, HookTarget, ResolveTargetOptions } from "./exclude.js";
 export { PRESETS, findPreset } from "./presets.js";
 export type { Preset } from "./presets.js";
 export { withMcp, McpSession, McpError } from "./mcp.js";

@@ -12,6 +12,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -62,7 +63,7 @@ const BACKEND_ENV = [
   "QDRANT_MODE",
 ] as const;
 
-function cli(args: string[], env: Record<string, string> = {}): Run {
+function cli(args: string[], env: Record<string, string> = {}, cwd?: string): Run {
   const childEnv: Record<string, string | undefined> = {
     ...process.env,
     HOME: home,
@@ -75,6 +76,7 @@ function cli(args: string[], env: Record<string, string> = {}): Run {
     const out = execFileSync(process.execPath, [CLI, ...args], {
       encoding: "utf8",
       env: { ...childEnv, ...env },
+      ...(cwd === undefined ? {} : { cwd }),
       stdio: ["ignore", "pipe", "pipe"],
     });
     return { code: 0, out };
@@ -511,6 +513,46 @@ describe("providers --example", () => {
 });
 
 describe("hook entry point", () => {
+  /**
+   * The test's own git, fully isolated.
+   *
+   * A developer running this has codeindex-sync installed, which means a global
+   * `core.hooksPath` — so an un-isolated `git commit` here would fire the real
+   * dispatcher and enqueue a temp directory into their real queue.
+   */
+  function git(cwd: string, ...args: string[]): void {
+    execFileSync("git", args, {
+      cwd,
+      stdio: "ignore",
+      env: { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    });
+  }
+
+  /** A repository under root, claimed for the stub provider and committed. */
+  function hookRepo(name: string): string {
+    const dir = path.join(home, name);
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "user.email", "t@example.com");
+    git(dir, "config", "user.name", "Test");
+    writeFileSync(path.join(dir, ".stub.json"), '{"projectId":"x"}\n', "utf8");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "init");
+    return dir;
+  }
+
+  /** A function, not a constant: `home` is assigned per test in beforeEach. */
+  const hookConfig = (extra: Record<string, unknown> = {}): unknown => ({
+    root: home,
+    providers: [
+      { name: "stub", command: "true", args: [], tools: { update: "u" }, detectFiles: [".stub.json"] },
+    ],
+    ...extra,
+  });
+
+  const queued = (): string[] =>
+    new Queue(path.join(state, "queue")).list().map((j) => j.repoPath);
+
   it("ignores an unknown hook rather than failing the git command", () => {
     // This runs inside the user's git command; a non-zero exit would break it.
     cli(["init", "--preset", "socraticode"]);
@@ -520,6 +562,46 @@ describe("hook entry point", () => {
   it("exits 0 when run outside any repository", () => {
     cli(["init", "--preset", "socraticode"]);
     expect(cli(["hook", "post-commit"]).code).toBe(0);
+  });
+
+  it("enqueues the repository when the hook fires in the main checkout", () => {
+    writeConfig(hookConfig());
+    const repo = hookRepo("main-checkout");
+    expect(cli(["hook", "post-commit"], {}, repo).code).toBe(0);
+    expect(queued()).toEqual([realpathSync(repo)]);
+  });
+
+  it("enqueues nothing when the hook fires in an agent worktree", () => {
+    // The marker is committed, so the worktree carries one too — nothing about it
+    // looks different to a provider, and it will be gone within the hour.
+    writeConfig(hookConfig());
+    const repo = hookRepo("agent-host");
+    const wt = path.join(repo, ".claude", "worktrees", "task");
+    mkdirSync(path.dirname(wt), { recursive: true });
+    git(repo, "worktree", "add", "-q", "-b", "task", wt);
+    expect(existsSync(path.join(wt, ".stub.json"))).toBe(true);
+
+    expect(cli(["hook", "post-commit"], {}, wt).code).toBe(0);
+    expect(queued()).toEqual([]);
+  });
+
+  it("enqueues an agent worktree once the config stops excluding it", () => {
+    // Proof the rule is data: same repository, same worktree, different config.
+    writeConfig(hookConfig({ excludePaths: [] }));
+    const repo = hookRepo("opted-in");
+    const wt = path.join(repo, ".claude", "worktrees", "task");
+    mkdirSync(path.dirname(wt), { recursive: true });
+    git(repo, "worktree", "add", "-q", "-b", "task", wt);
+
+    expect(cli(["hook", "post-commit"], {}, wt).code).toBe(0);
+    // Still not the worktree's own path: git identifies it, and the main
+    // checkout is what carries the index.
+    expect(queued()).toEqual([]);
+  });
+
+  it("doctor names the excluded paths, so a silent skip is explainable", () => {
+    writeConfig(hookConfig());
+    expect(cli(["doctor"]).out).toContain(".claude/worktrees");
   });
 });
 

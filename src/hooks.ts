@@ -13,7 +13,9 @@
  *  - Hooks are NOT a login shell. They never source a shell profile, so a
  *    handler cannot rely on the user's exported environment.
  *  - The hook's cwd is frequently a throwaway worktree that no longer exists by
- *    the time anything runs. Handlers get a resolved repo root instead.
+ *    the time anything runs. Handlers get a resolved project root instead, and
+ *    events from excluded paths and linked worktrees are dropped before dispatch
+ *    rather than handed round — see `exclude.ts`.
  *  - A handler that throws must never block other handlers, or one broken
  *    extension takes the whole hook path down with it.
  */
@@ -74,8 +76,9 @@ export function isGitHook(name: string): name is GitHook {
 export interface HookEvent {
   hook: GitHook;
   /**
-   * Absolute path to the repository root. Already resolved from the raw hook
-   * cwd, so handlers never see a deleted worktree path.
+   * Absolute path to the project root — the nearest enclosing directory a
+   * configured provider claims, else the repository root. Already resolved from
+   * the raw hook cwd, so handlers never see a deleted worktree path.
    */
   repoPath: string;
   /** Raw hook arguments, as Git passed them. */

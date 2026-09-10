@@ -20,11 +20,18 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
+import { DEFAULT_EXCLUDE_PATHS, patternSegments, unsupportedGlobSegments } from "./exclude.js";
 import type { McpProviderConfig } from "./providers/mcp-provider.js";
 
 export interface Config {
   /** Only repos under this root are ever enqueued. */
   root: string;
+  /**
+   * Path patterns that are never project roots — agent-tool worktrees, above
+   * all. Configurable because every tool picks its own directory and more keep
+   * appearing; see `exclude.ts` for the matching rules.
+   */
+  excludePaths: string[];
   /** Ordered: the first provider claiming a repo wins, so order is meaningful. */
   providers: McpProviderConfig[];
   /** Retries before a job is parked in failed/. */
@@ -37,6 +44,7 @@ export interface Config {
 
 export const DEFAULT_CONFIG: Config = {
   root: path.join(homedir(), "workspace"),
+  excludePaths: [...DEFAULT_EXCLUDE_PATHS],
   providers: [],
   maxAttempts: 3,
   backoffSeconds: 10,
@@ -95,7 +103,19 @@ function validateProvider(p: unknown, index: number): McpProviderConfig {
   };
   if (typeof o["description"] === "string") cfg.description = o["description"];
   if (typeof o["repoArg"] === "string") cfg.repoArg = o["repoArg"];
-  if (Array.isArray(o["detectFiles"])) cfg.detectFiles = o["detectFiles"] as string[];
+  if (Array.isArray(o["detectFiles"])) {
+    // Every entry, not just the array: these become `path.join(dir, entry)` in
+    // the hook path, where a number throws a TypeError *inside the user's git
+    // command*. Rejecting it at load turns that into one clear config error.
+    const bad = o["detectFiles"].findIndex((f) => typeof f !== "string" || f === "");
+    if (bad !== -1) {
+      throw new ConfigError(
+        `${where}.detectFiles[${bad}] is not a filename`,
+        `each entry is a marker file name, e.g. "detectFiles": [".socraticode.json"]`,
+      );
+    }
+    cfg.detectFiles = o["detectFiles"] as string[];
+  }
   if (typeof o["markerContent"] === "string") cfg.markerContent = o["markerContent"];
   if (Array.isArray(o["busyMarkers"])) cfg.busyMarkers = o["busyMarkers"] as string[];
   if (Array.isArray(o["asyncIndexMarkers"])) {
@@ -122,6 +142,46 @@ function validateProvider(p: unknown, index: number): McpProviderConfig {
   return cfg;
 }
 
+/**
+ * Validate `excludePaths`. Both failure modes here are silent ones.
+ *
+ * A pattern of only wildcards excludes every repository on the machine, and the
+ * symptom — nothing is ever indexed again — looks exactly like broken hooks. A
+ * pattern using glob syntax this does not implement excludes nothing, and looks
+ * exactly like a pattern that works. Either way the config file is the last place
+ * anyone would look, so neither is allowed to load.
+ */
+function parseExcludePaths(raw: unknown): string[] {
+  if (raw === undefined) return [...DEFAULT_EXCLUDE_PATHS];
+  if (!Array.isArray(raw)) {
+    throw new ConfigError(
+      "excludePaths must be an array of path patterns",
+      `e.g. "excludePaths": ${JSON.stringify(DEFAULT_EXCLUDE_PATHS)} — or [] to exclude nothing`,
+    );
+  }
+  return raw.map((p, i) => {
+    if (typeof p !== "string") {
+      throw new ConfigError(`excludePaths[${i}] is not a string`, "each pattern is a path fragment");
+    }
+    const globs = unsupportedGlobSegments(p);
+    if (globs.length > 0) {
+      // A `*` is taken literally, so such a pattern excludes nothing and looks
+      // like it works. Say so now rather than leaving worktrees being indexed.
+      throw new ConfigError(
+        `excludePaths[${i}] (${JSON.stringify(p)}) uses glob syntax that is not implemented: ${globs.join(", ")}`,
+        `patterns are runs of path segments, with \`**\` allowed only as a whole segment — e.g. ${JSON.stringify(DEFAULT_EXCLUDE_PATHS[0])}`,
+      );
+    }
+    if (patternSegments(p).length === 0) {
+      throw new ConfigError(
+        `excludePaths[${i}] (${JSON.stringify(p)}) names no directory, so it would exclude every repository`,
+        `name a directory, e.g. ${JSON.stringify(DEFAULT_EXCLUDE_PATHS[0])} — or use [] to exclude nothing`,
+      );
+    }
+    return p;
+  });
+}
+
 export function parseConfig(raw: string): Config {
   let data: unknown;
   try {
@@ -139,6 +199,7 @@ export function parseConfig(raw: string): Config {
   const providersRaw = Array.isArray(o["providers"]) ? o["providers"] : [];
   return {
     root: typeof o["root"] === "string" ? o["root"] : DEFAULT_CONFIG.root,
+    excludePaths: parseExcludePaths(o["excludePaths"]),
     providers: providersRaw.map(validateProvider),
     maxAttempts: typeof o["maxAttempts"] === "number" ? o["maxAttempts"] : DEFAULT_CONFIG.maxAttempts,
     backoffSeconds:

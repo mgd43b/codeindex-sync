@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -8,6 +8,7 @@ import {
   currentHead,
   goneBranches,
   isDirty,
+  isLinkedWorktree,
   listWorktrees,
   mainWorktree,
   pruneWorktrees,
@@ -36,7 +37,7 @@ afterEach(() => {
 describe("repoRoot", () => {
   it("finds the root from a subdirectory", () => {
     const sub = path.join(dir, "nested", "deep");
-    execFileSync("mkdir", ["-p", sub]);
+    mkdirSync(sub, { recursive: true });
     expect(repoRoot(sub)).toBe(repoRoot(dir));
   });
 
@@ -63,6 +64,39 @@ describe("mainWorktree", () => {
 
   it("is a no-op on the main worktree itself", () => {
     expect(mainWorktree(dir)).toBe(repoRoot(dir));
+  });
+});
+
+describe("isLinkedWorktree", () => {
+  it("is false for the main checkout", () => {
+    expect(isLinkedWorktree(dir)).toBe(false);
+  });
+
+  it("is false for a subdirectory of the main checkout", () => {
+    // The /repo/src trap: a project can be legitimately rooted here, and the
+    // tempting `dir !== mainWorktree(dir)` test calls this a worktree.
+    const sub = path.join(dir, "nested", "deep");
+    mkdirSync(sub, { recursive: true });
+    expect(isLinkedWorktree(sub)).toBe(false);
+  });
+
+  it("is true inside a linked worktree, and in its subdirectories", () => {
+    const wt = path.join(dir, "..", `wt-linked-${path.basename(dir)}`);
+    run(["worktree", "add", "-q", "-b", "linked", wt]);
+    const sub = path.join(wt, "sub");
+    mkdirSync(sub, { recursive: true });
+    expect(isLinkedWorktree(wt)).toBe(true);
+    expect(isLinkedWorktree(sub)).toBe(true);
+    rmSync(wt, { recursive: true, force: true });
+  });
+
+  it("is null when git cannot say, never a guess", () => {
+    // A deleted worktree is the normal case by the time a hook handler runs, and
+    // "don't know" must not be read as "yes" — that would stop indexing repos.
+    const plain = mkdtempSync(path.join(tmpdir(), "codeindex-plain-"));
+    expect(isLinkedWorktree(plain)).toBeNull();
+    expect(isLinkedWorktree(path.join(dir, "absent"))).toBeNull();
+    rmSync(plain, { recursive: true, force: true });
   });
 });
 

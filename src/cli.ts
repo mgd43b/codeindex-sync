@@ -26,6 +26,7 @@ import {
 import { homedir } from "node:os";
 import path from "node:path";
 import { ConfigError, configPath, loadConfig, saveConfig, type Config } from "./config.js";
+import { resolveHookTarget } from "./exclude.js";
 import {
   deleteBranch,
   globalHooksPath,
@@ -239,6 +240,10 @@ program
       }
     }
     ui.ok(`watching ${cfg.root}`);
+    // Worth a line of its own: "why is this repo never indexed?" is otherwise
+    // answered by reading the source, and an agent worktree is a plausible place
+    // for someone to be sitting when they run `doctor`.
+    if (cfg.excludePaths.length > 0) ui.ok(`excluding ${cfg.excludePaths.join(", ")}`);
 
     ui.heading("Git hooks");
     const hooks = globalHooksPath();
@@ -1795,17 +1800,31 @@ program
     // Unknown hooks are ignored rather than erroring: this runs inside the
     // user's git commands and must never break them.
     if (!isGitHook(name)) return;
+    // The hook's own cwd is frequently gone by now — a throwaway worktree
+    // removed between the commit and this process starting — and process.cwd()
+    // throws (uv_cwd ENOENT) when it is. There is nothing to enqueue then.
+    let cwd: string;
+    try {
+      cwd = process.cwd();
+    } catch {
+      return;
+    }
     const cfg = config();
-    // Resolve to the MAIN worktree, so a linked worktree does not create a
-    // second index and a deleted worktree cwd is never used.
-    const root = mainWorktree(process.cwd()) ?? repoRoot(process.cwd());
-    if (!root) return;
+    // Decide from the directory the hook actually fired in, before anything is
+    // resolved: an excluded agent worktree is only recognisable there, and after
+    // resolution the evidence is gone. Excluded paths and linked worktrees are
+    // dropped whole — nothing is dispatched, so no handler acts on them.
+    const target = resolveHookTarget(cwd, {
+      excludePaths: cfg.excludePaths,
+      markers: cfg.providers.flatMap((p) => p.detectFiles ?? []),
+    });
+    if (target.skip) return;
     // Dispatch through the registry rather than enqueuing directly: the
     // built-in indexer is just another subscriber, so third-party handlers
     // receive the same event on the same terms.
     await buildHookRegistry(cfg).dispatch({
       hook: name as GitHook,
-      repoPath: root,
+      repoPath: target.path,
       args,
       at: nowIso(),
     });
