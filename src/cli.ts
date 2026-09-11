@@ -890,6 +890,9 @@ program
     const job = queue.enqueue({ repoPath: target, hook: "manual", full: opts.full });
     const result = await worker.runJob(job);
     ui.line();
+    // Exhaustive on purpose. A catch-all here once turned `unchanged` — the
+    // commonest outcome of all — into "failed — unknown" with exit 1, so a
+    // scheduled sync of a quiet repository failed on every run.
     switch (result.outcome) {
       case "indexed":
         ui.ok(result.summary || "indexed");
@@ -897,15 +900,24 @@ program
       case "coalesced":
         ui.info(`skipped — ${result.reason}`);
         break;
+      case "unchanged":
+        ui.info("unchanged — HEAD has not moved and the tree is clean; nothing to index");
+        break;
       case "busy":
         ui.warn("backend is already indexing this repo; job left queued");
         break;
       case "skipped":
         ui.warn(`skipped — ${result.reason}`);
         break;
-      default:
-        ui.bad(`failed — ${"error" in result ? result.error : "unknown"}`);
+      case "retry":
+      case "failed":
+        ui.bad(`failed — ${result.error}`);
         process.exitCode = 1;
+        break;
+      default: {
+        const unhandled: never = result;
+        throw new Error(`unhandled job outcome: ${JSON.stringify(unhandled)}`);
+      }
     }
   });
 

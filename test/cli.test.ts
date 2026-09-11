@@ -512,22 +512,66 @@ describe("providers --example", () => {
   });
 });
 
-describe("hook entry point", () => {
-  /**
-   * The test's own git, fully isolated.
-   *
-   * A developer running this has codeindex-sync installed, which means a global
-   * `core.hooksPath` — so an un-isolated `git commit` here would fire the real
-   * dispatcher and enqueue a temp directory into their real queue.
-   */
-  function git(cwd: string, ...args: string[]): void {
-    execFileSync("git", args, {
-      cwd,
-      stdio: "ignore",
-      env: { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+/**
+ * The test's own git, fully isolated.
+ *
+ * A developer running this has codeindex-sync installed, which means a global
+ * `core.hooksPath` — so an un-isolated `git commit` here would fire the real
+ * dispatcher and enqueue a temp directory into their real queue.
+ */
+function git(cwd: string, ...args: string[]): void {
+  execFileSync("git", args, {
+    cwd,
+    stdio: "ignore",
+    env: { ...process.env, HOME: home, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+  });
+}
+
+describe("sync", () => {
+  /** A backend whose update tool always succeeds, so the outcome is ours to read. */
+  function updatingBackend(): void {
+    const file = path.join(home, "update-server.mjs");
+    writeFileSync(
+      file,
+      `let buf="";process.stdin.on("data",c=>{buf+=c;let n;while((n=buf.indexOf("\\n"))!==-1){const l=buf.slice(0,n).trim();buf=buf.slice(n+1);if(!l)continue;const m=JSON.parse(l);
+       if(m.method==="initialize")process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{}})+"\\n");
+       if(m.method==="tools/call")process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{content:[{type:"text",text:"Updated project index"}]}})+"\\n");}});`,
+      "utf8",
+    );
+    writeConfig({
+      root: home,
+      providers: [
+        { name: "stub", command: process.execPath, args: [file], tools: { update: "u" }, detectFiles: [".stub.json"] },
+      ],
     });
   }
 
+  it("treats an unchanged repository as nothing to do, not as a failure", () => {
+    // The fingerprint short-circuit is the commonest outcome of a scheduled
+    // sync. Exiting 1 for it made every quiet repository look broken, and made
+    // the exit code useless to a scheduler that needs to tell real failures apart.
+    updatingBackend();
+    const dir = path.join(home, "quiet");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "user.email", "t@example.com");
+    git(dir, "config", "user.name", "Test");
+    writeFileSync(path.join(dir, ".stub.json"), '{"projectId":"quiet"}\n', "utf8");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "init");
+
+    const first = cli(["sync", dir]);
+    expect(first.code).toBe(0);
+    expect(first.out).toMatch(/Updated project index/);
+
+    const second = cli(["sync", dir]);
+    expect(second.out).toMatch(/unchanged/);
+    expect(second.out).not.toMatch(/failed/);
+    expect(second.code).toBe(0);
+  });
+});
+
+describe("hook entry point", () => {
   /** A repository under root, claimed for the stub provider and committed. */
   function hookRepo(name: string): string {
     const dir = path.join(home, name);
