@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/mgd43b/codeindex-sync/compare/v0.3.2...v0.4.0) (2026-09-12)
+
+
+### ⚠ BREAKING CHANGES
+
+* Node 20 is no longer supported; the minimum is Node 22.12.
+
+### Features
+
+* require Node 22.12, and take vitest 5 ([#37](https://github.com/mgd43b/codeindex-sync/issues/37)) ([b06a9b8](https://github.com/mgd43b/codeindex-sync/commit/b06a9b89ea836f319cb4ddc235193881b72cc24c))
+
 ## [0.3.2](https://github.com/mgd43b/codeindex-sync/compare/v0.3.1...v0.3.2) (2026-09-12)
 
 
