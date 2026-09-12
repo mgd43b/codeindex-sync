@@ -166,7 +166,7 @@ See [docs/releasing.md](docs/releasing.md).
 
 ## Requirements
 
-Node >= 20. Works on macOS and Linux; CI covers both across Node 20, 22 and 24.
+Node >= 22.12. Works on macOS and Linux; CI covers both across Node 22 and 24.
 
 ## Licence
 
