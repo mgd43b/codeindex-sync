@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/mgd43b/codeindex-sync/compare/v0.3.1...v0.3.2) (2026-09-12)
+
+
+### Bug Fixes
+
+* **sync:** report an unchanged repository as unchanged, not failed ([#35](https://github.com/mgd43b/codeindex-sync/issues/35)) ([970c797](https://github.com/mgd43b/codeindex-sync/commit/970c7976a29c8c749f157f65a1a291c3dac275a7))
+
 ## [0.3.1](https://github.com/mgd43b/codeindex-sync/compare/v0.3.0...v0.3.1) (2026-09-11)
 
 
