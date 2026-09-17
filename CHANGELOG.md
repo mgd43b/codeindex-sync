@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.1](https://github.com/mgd43b/codeindex-sync/compare/v0.4.0...v0.4.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* **sync:** ride out a failing status poll and make the retries it announces ([#41](https://github.com/mgd43b/codeindex-sync/issues/41)) ([e4d8724](https://github.com/mgd43b/codeindex-sync/commit/e4d872434eabf41235093daca5b8fc4e84d7e5cf))
+
 ## [0.4.0](https://github.com/mgd43b/codeindex-sync/compare/v0.3.2...v0.4.0) (2026-09-12)
 
 
