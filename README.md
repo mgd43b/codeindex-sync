@@ -64,7 +64,7 @@ behaviour here comes from a failure seen in production:
 | `doctor` | Diagnose config, hooks and backend health — every problem carries a remedy |
 | `status` | Queue, worker and failures |
 | `list [repo] [--all] [--stale] [--json]` | What the backend holds — one repo, or every index with status, age and file counts |
-| `sync [repo] [--full]` | Index now, retrying a failure up to `maxAttempts` times |
+| `sync [repo] [--full]` | Index now, retrying a failure until `maxAttempts` attempts (the first included) have been made |
 | `verify [repo] [--repair]` | Compare what an index claims to hold against what it actually holds |
 | `drain` / `once` | Process the queue |
 | `retry` / `forget [--all]` | Requeue or drop jobs that used up their attempts |
