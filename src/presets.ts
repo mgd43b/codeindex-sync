@@ -51,7 +51,11 @@ export const PRESETS: Preset[] = [
       // name from a hash of the absolute path, so the same repo at a second path
       // — a worktree, a CI clone — becomes a separate duplicate index.
       markerContent: '{"projectId":"${name}"}\n',
-      busyMarkers: ["another indexer", "BUSY"],
+      // What SocratiCode says when the project is already being indexed. By
+      // another process, inside an otherwise ordinary codebase_update reply:
+      // "Another process is already indexing this project, skipping". By the same
+      // process: "⚠ Indexing is already in progress for: <path>".
+      busyMarkers: ["already indexing this project", "already in progress"],
       timeoutMs: 60 * 60 * 1000,
     },
   },

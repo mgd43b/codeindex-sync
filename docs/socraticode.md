@@ -218,8 +218,8 @@ To drain by hand instead:
 codeindex-sync drain
 ```
 
-Draining concurrently is safe: the worker takes a lock and a second run exits
-immediately.
+Draining concurrently is safe: each drain takes the worker lock, and a second
+one exits immediately.
 
 ## Everyday commands
 
@@ -422,11 +422,20 @@ machine, so codeindex-sync ignores anything outside that root by design.
 **`list` says `incomplete`.** A previous run was interrupted. Only a full
 reindex clears it: `codeindex-sync sync --full`.
 
-**Jobs land in `failed`.** `codeindex-sync status` shows them and the error;
-`codeindex-sync retry` requeues them.
+**Jobs land in `failed`.** Only after `maxAttempts` attempts (three by default),
+or at once for a run whose SocratiCode process had to be killed. `codeindex-sync status` shows them and the last error;
+`codeindex-sync retry` requeues them, a full reindex still full.
 
-**"another worker is draining".** A previous run died holding the lock:
-`codeindex-sync unlock`. It refuses if the holder is genuinely alive.
+**`sync` pauses for up to a minute after a failure.** Before it retries,
+codeindex-sync waits for the previous SocratiCode process to exit, and SocratiCode
+lets its in-flight batch finish first — for up to 60 seconds. A retry started
+sooner would be refused SocratiCode's lock on the project, report "started",
+index nothing, and fail as incomplete. `killAfterMs` in the provider config
+(default 75 seconds) caps the wait.
+
+**"another worker is draining".** A drain is running. A lock left behind by a
+process that died is reclaimed automatically, so this means a live holder;
+`codeindex-sync unlock --force` is only for one that is alive but wedged.
 
 **Search stopped finding a file you know is there.** That is the signature of a
 file claimed as indexed with no chunks behind it — `codeindex-sync verify` names

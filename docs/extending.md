@@ -64,7 +64,36 @@ your backend will not understand.
 **`busyMarkers` prevents a real bug.** Most backends hold their own per-project
 lock. When another indexer holds it, the reply is *contention*, not failure — the
 job must be requeued without burning a retry attempt. Get this wrong and three
-unlucky collisions park a perfectly healthy repository in `failed/`.
+unlucky collisions park a perfectly healthy repository in `failed/`. Markers are
+matched as whole words or phrases, case-insensitively, only against what the
+backend actually replied and with the repository's own path removed first — not
+against the error text of a session that died. Prefer phrases a backend says
+("already indexing this project") to bare words that can turn up in a file name.
+
+**Retries are top-level config, not per provider.** A failed attempt is retried in
+the same process — by `sync`, `once` and `drain` alike — after `backoffSeconds`
+(default 10), doubling each time, until `maxAttempts` (default 3, the first
+included) have been made. The job is then parked in `failed/`, where `status`
+shows why and `retry` requeues it.
+
+**`timeoutMs` and `killAfterMs` bound a backend's life.** `timeoutMs` (default one
+hour) caps a whole session; a first full index of a large repository needs more.
+However a session ends, the backend's input is closed, it is sent SIGTERM once,
+and then it is *waited for*: a backend that finishes its in-flight work before
+exiting still holds its project lock until it does, and a retry started beside it
+would be refused that lock. `killAfterMs` (default 75 seconds) is how long the
+wait may last before the backend is killed outright. Each backend runs in its own
+process group: SIGTERM goes to the launcher first — `npx` passes it on, and a
+backend should not get it twice — then to whatever is left of the group once the
+launcher has exited, and the kill goes to the whole group, so a backend behind a
+launcher or a shell script is reached either way. For the same reason the CLI
+passes a SIGINT, SIGTERM or SIGHUP that interrupts it on to any backend still
+running; code embedding `McpSession` can opt into the same with
+`forwardSignalsToBackends()`. A run whose backend had to be killed is parked
+at once rather than retried, because its lock outlives it until the backend's own
+staleness rule frees it. A run that merely timed out is retried like any other
+failure: once its backend has exited, a backend that checkpoints resumes where
+the last attempt stopped.
 
 **`asyncIndexMarkers` prevents a worse one.** A full-index tool is often
 fire-and-forget: it starts the work on the backend's own event loop and returns
@@ -105,9 +134,21 @@ Three consequences worth knowing:
 - A run that stops having produced no index at all, or one the backend still
   calls incomplete, is a failure — not a success with a small number in it.
 
-The wait is bounded by the caller's abort signal and by the session's own hard
-timer, which kills the child and makes every later call fail at once. Both end as
-a failure: a backend that never finishes must never look like one that did.
+A status tool that answers with an *error* is not a verdict. Its backend is
+running, and the error can be the backend's own read tripping over storage it is
+creating at that moment — SocratiCode's `codebase_status` fails exactly this way
+when a poll lands while a first index is still creating its Qdrant collection.
+Abandoning the run over it would close the session and kill the index being
+waited on. So the status tool is asked again, and only errors that go on
+unbroken for the settle window (eight `pollIntervalMs`, 16 seconds by default)
+end the wait as a failure. A session that died, timed out, or rejected the call
+outright — an unknown tool, bad arguments — ends it at once, because nothing
+more can be learned from it.
+
+Beyond that, the wait is bounded by the session's hard timer, which ends the
+session and makes every later call fail at once, and — for code that embeds the
+provider — by an abort signal. Both end as a failure: a backend that never
+finishes must never look like one that did.
 
 **A removal is verified, not assumed.** `cleanup`'s entire input is indexes whose
 directory is gone — that is the definition of an orphan — and a backend that

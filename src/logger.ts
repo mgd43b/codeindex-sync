@@ -23,7 +23,11 @@ export class Logger {
 
   write(message: string): void {
     const line = `${nowIso()} ${message}`;
-    this.echo?.(line);
+    try {
+      this.echo?.(line);
+    } catch {
+      // A closed terminal must not take the log down with it.
+    }
     try {
       mkdirSync(path.dirname(this.file), { recursive: true });
       this.rotateIfNeeded();

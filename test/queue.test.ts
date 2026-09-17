@@ -33,6 +33,22 @@ describe("nowIso", () => {
 });
 
 describe("Queue", () => {
+  it("does not let a re-enqueue downgrade a pending full reindex", () => {
+    // A hook firing behind a queued `sync --full` must not turn it incremental.
+    const q = new Queue(dir);
+    q.enqueue({ repoPath: "/repo/a", hook: "manual", full: true });
+    q.enqueue({ repoPath: "/repo/a", hook: "post-commit" });
+    expect(q.list()[0]?.full).toBe(true);
+    expect(q.list()[0]?.hook).toBe("post-commit");
+  });
+
+  it("upgrades a pending incremental when a full reindex is asked for", () => {
+    const q = new Queue(dir);
+    q.enqueue({ repoPath: "/repo/a", hook: "post-commit" });
+    q.enqueue({ repoPath: "/repo/a", hook: "manual", full: true });
+    expect(q.list()[0]?.full).toBe(true);
+  });
+
   it("round-trips a job", () => {
     const q = new Queue(dir);
     q.enqueue({ repoPath: "/repo/a", hook: "post-commit" });

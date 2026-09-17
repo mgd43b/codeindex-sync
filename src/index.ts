@@ -18,7 +18,7 @@ export { GIT_HOOKS, HookRegistry, isGitHook } from "./hooks.js";
 export type { DispatchResult, GitHook, HookEvent, HookHandler } from "./hooks.js";
 export { WorkerLock, isAlive } from "./lock.js";
 export { Worker } from "./worker.js";
-export type { JobResult, WorkerOptions } from "./worker.js";
+export type { FailedJob, FinalJobResult, JobResult, WorkerOptions } from "./worker.js";
 export { Logger, silentLogger } from "./logger.js";
 export { resolvePaths } from "./paths.js";
 export type { Paths } from "./paths.js";
@@ -34,7 +34,7 @@ export {
 export type { HookDecision, HookSkip, HookTarget, ResolveTargetOptions } from "./exclude.js";
 export { PRESETS, findPreset } from "./presets.js";
 export type { Preset } from "./presets.js";
-export { withMcp, McpSession, McpError } from "./mcp.js";
+export { forwardSignalsToBackends, withMcp, McpSession, McpError } from "./mcp.js";
 export { createIndexHandler } from "./handlers/index-handler.js";
 export type { IndexHandlerOptions } from "./handlers/index-handler.js";
 export { buildHookRegistry, buildProviderRegistry } from "./runtime.js";
