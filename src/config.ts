@@ -34,9 +34,12 @@ export interface Config {
   excludePaths: string[];
   /** Ordered: the first provider claiming a repo wins, so order is meaningful. */
   providers: McpProviderConfig[];
-  /** Retries before a job is parked in failed/. */
+  /**
+   * Attempts, the first included, before a job is parked in failed/. Every
+   * command that runs a job — `sync`, `once`, `drain` — makes them in-process.
+   */
   maxAttempts: number;
-  /** Base seconds for exponential retry backoff. */
+  /** Seconds before the first retry; each later retry waits twice as long. */
   backoffSeconds: number;
   /** Rotate the worker log past this size. */
   logMaxBytes: number;
@@ -122,24 +125,52 @@ function validateProvider(p: unknown, index: number): McpProviderConfig {
     cfg.asyncIndexMarkers = o["asyncIndexMarkers"] as string[];
   }
   if (Array.isArray(o["progressMarkers"])) cfg.progressMarkers = o["progressMarkers"] as string[];
-  if (o["pollIntervalMs"] !== undefined) {
-    // A zero, negative or NaN interval turns the status poll into a spin loop
-    // that hammers the backend. Rejecting it here beats discovering it as a
-    // pegged CPU during someone's first full reindex.
-    const ms = o["pollIntervalMs"];
-    if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
-      throw new ConfigError(
-        `${where}.pollIntervalMs must be a positive number of milliseconds`,
-        `use a value like 2000, or remove "pollIntervalMs" from ${where} to take the default`,
-      );
-    }
-    cfg.pollIntervalMs = ms;
-  }
-  if (typeof o["timeoutMs"] === "number") cfg.timeoutMs = o["timeoutMs"];
+  // A zero, negative or NaN interval turns the status poll into a spin loop
+  // that hammers the backend. Rejecting it here beats discovering it as a
+  // pegged CPU during someone's first full reindex.
+  const pollIntervalMs = positiveMs(o, "pollIntervalMs", where, 2000);
+  if (pollIntervalMs !== undefined) cfg.pollIntervalMs = pollIntervalMs;
+  // Zero or less fails every call at once, reported as a timeout. A value that
+  // is not a number at all has always been ignored in favour of the default,
+  // and still is: rejecting it now would stop indexing for a config that works,
+  // silently, since hooks discard the error.
+  const timeoutMs = typeof o["timeoutMs"] === "number" ? positiveMs(o, "timeoutMs", where, 3_600_000) : undefined;
+  if (timeoutMs !== undefined) cfg.timeoutMs = timeoutMs;
+  // Zero or less kills every backend the moment it is asked to stop, leaving
+  // whatever it held to go stale.
+  const killAfterMs = positiveMs(o, "killAfterMs", where, 75_000);
+  if (killAfterMs !== undefined) cfg.killAfterMs = killAfterMs;
   if (typeof o["env"] === "object" && o["env"] !== null) {
     cfg.env = o["env"] as Record<string, string>;
   }
   return cfg;
+}
+
+/** The longest delay Node's timers honour; a longer one fires after 1ms instead. */
+const MAX_TIMER_MS = 2 ** 31 - 1;
+
+/** An optional provider field that must be a positive number of milliseconds a timer can wait. */
+function positiveMs(
+  o: Record<string, unknown>,
+  key: string,
+  where: string,
+  example: number,
+): number | undefined {
+  const ms = o[key];
+  if (ms === undefined) return undefined;
+  if (typeof ms !== "number" || !Number.isFinite(ms) || ms <= 0) {
+    throw new ConfigError(
+      `${where}.${key} must be a positive number of milliseconds`,
+      `use a value like ${example}, or remove "${key}" from ${where} to take the default`,
+    );
+  }
+  if (ms > MAX_TIMER_MS) {
+    throw new ConfigError(
+      `${where}.${key} is longer than ${MAX_TIMER_MS}ms (about 24.8 days), the longest wait Node's timers support — a longer one fires after 1ms`,
+      `use a value like ${example}, or at most ${MAX_TIMER_MS}`,
+    );
+  }
+  return ms;
 }
 
 /**

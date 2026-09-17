@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -6,7 +6,7 @@ import { silentLogger } from "../src/logger.js";
 import { resolvePaths } from "../src/paths.js";
 import { ProviderRegistry, type IndexOutcome, type IndexProvider } from "../src/provider.js";
 import { Queue, jobKey, nowIso } from "../src/queue.js";
-import { Worker } from "../src/worker.js";
+import { markRunning, runningJobs, Worker } from "../src/worker.js";
 
 let state: string;
 let repo: string;
@@ -34,7 +34,10 @@ function fakeProvider(results: IndexOutcome[] | IndexOutcome, name = "fake"): In
   };
 }
 
-function makeWorker(provider: IndexProvider, over: Partial<{ maxAttempts: number }> = {}) {
+function makeWorker(
+  provider: IndexProvider,
+  over: Partial<{ maxAttempts: number; sleep: (ms: number) => Promise<void> }> = {},
+) {
   const paths = resolvePaths(state);
   const registry = new ProviderRegistry().register(provider);
   return new Worker({
@@ -43,7 +46,7 @@ function makeWorker(provider: IndexProvider, over: Partial<{ maxAttempts: number
     logger: silentLogger,
     maxAttempts: over.maxAttempts ?? 3,
     backoffSeconds: 0,
-    sleep: async () => {}, // never actually wait out backoff in tests
+    sleep: over.sleep ?? (async () => {}), // never actually wait out backoff in tests
   });
 }
 
@@ -172,6 +175,124 @@ describe("Worker.runJob", () => {
   });
 });
 
+describe("Worker.run", () => {
+  it("makes the retry a failure announces, and stops at the first success", async () => {
+    // `sync` used to make one attempt: it logged the retry, slept, and exited.
+    const provider = fakeProvider([
+      { status: "failed", summary: "", error: "transient" },
+      { status: "ok", summary: "Added: 3" },
+    ]);
+    const index = vi.spyOn(provider, "index");
+    const res = await makeWorker(provider).run(enqueue());
+
+    expect(res.outcome).toBe("indexed");
+    expect(index).toHaveBeenCalledTimes(2);
+    expect(index.mock.calls[1]?.[0].reason).toBe("retry");
+    expect(new Queue(resolvePaths(state).queue).size).toBe(0);
+  });
+
+  it("makes exactly maxAttempts attempts, then parks the job", async () => {
+    const provider = fakeProvider({ status: "failed", summary: "", error: "still broken" });
+    const index = vi.spyOn(provider, "index");
+    const sleep = vi.fn(async () => {});
+    const w = makeWorker(provider, { maxAttempts: 3, sleep });
+    const res = await w.run(enqueue());
+
+    expect(res).toEqual({ outcome: "failed", error: "still broken" });
+    expect(index).toHaveBeenCalledTimes(3);
+    // A backoff before each retry, none after the last attempt.
+    expect(sleep).toHaveBeenCalledTimes(2);
+    expect(new Queue(resolvePaths(state).queue).size).toBe(0);
+    const [parked] = w.listFailed();
+    expect(parked?.attempts).toBe(3);
+    expect(parked?.lastError).toBe("still broken");
+  });
+
+  it("parks a failure the provider marks not retryable without spending attempts", async () => {
+    const provider = fakeProvider({
+      status: "failed",
+      summary: "",
+      error: "timed out after 57600000ms",
+      retryable: false,
+    });
+    const index = vi.spyOn(provider, "index");
+    const sleep = vi.fn(async () => {});
+    const w = makeWorker(provider, { sleep });
+    const res = await w.run(enqueue());
+
+    expect(res.outcome).toBe("failed");
+    expect(index).toHaveBeenCalledTimes(1);
+    expect(sleep).not.toHaveBeenCalled();
+    expect(w.listFailed()).toHaveLength(1);
+  });
+
+  it("keeps a job full and its attempts bounded when a hook re-enqueues during the backoff", async () => {
+    // A hook firing during the backoff overwrites the queue file with an
+    // incremental job at attempt 0. Re-reading that file would downgrade the
+    // run and reset its attempts every time — unbounded retries.
+    const seen: boolean[] = [];
+    const provider = fakeProvider([]);
+    provider.index = async (req) => {
+      seen.push(req.full);
+      // Succeeds only far past maxAttempts, so a broken run() fails here, not hangs.
+      return seen.length > 10
+        ? { status: "ok", summary: "done" }
+        : { status: "failed", summary: "", error: "transient" };
+    };
+    const sleep = async (): Promise<void> => {
+      new Queue(resolvePaths(state).queue).enqueue({ repoPath: repo, hook: "post-commit" });
+    };
+    const w = makeWorker(provider, { maxAttempts: 3, sleep });
+    const res = await w.run(enqueue({ full: true }));
+
+    expect(res.outcome).toBe("failed");
+    expect(seen).toEqual([true, true, true]);
+    const [parked] = w.listFailed();
+    expect(parked?.attempts).toBe(3);
+    expect(parked?.full).toBe(true);
+  });
+});
+
+describe("Worker running markers", () => {
+  it("marks a job running for exactly as long as its attempt", async () => {
+    const paths = resolvePaths(state);
+    let during: string[] = [];
+    const provider = fakeProvider([]);
+    provider.index = async () => {
+      during = runningJobs(paths.processing).map((j) => j.repoPath);
+      return { status: "ok", summary: "done" };
+    };
+    await makeWorker(provider).runJob(enqueue());
+    expect(during).toEqual([repo]);
+    expect(runningJobs(paths.processing)).toEqual([]);
+  });
+
+  it("does not report a marker left by a dead process as running", () => {
+    const paths = resolvePaths(state);
+    markRunning(paths.processing, enqueue(), 2 ** 22 + 12345);
+    expect(runningJobs(paths.processing)).toEqual([]);
+  });
+
+  it("leaves a marker alone while its process is alive", () => {
+    const paths = resolvePaths(state);
+    const w = makeWorker(fakeProvider({ status: "ok", summary: "" }));
+    // The test runner itself stands in for another live worker.
+    markRunning(paths.processing, enqueue(), process.ppid);
+    expect(w.recoverOrphans()).toBe(0);
+    expect(runningJobs(paths.processing).map((j) => j.repoPath)).toEqual([repo]);
+  });
+
+  it("clears a dead process's marker without requeueing a job that is still queued", () => {
+    const paths = resolvePaths(state);
+    const w = makeWorker(fakeProvider({ status: "ok", summary: "" }));
+    const job = enqueue({ attempts: 1 });
+    markRunning(paths.processing, job, 2 ** 22 + 12345);
+    expect(w.recoverOrphans()).toBe(0);
+    expect(readdirSync(paths.processing).filter((f) => f.endsWith(".job"))).toHaveLength(0);
+    expect(new Queue(paths.queue).list()[0]?.attempts).toBe(1);
+  });
+});
+
 describe("Worker crash recovery", () => {
   it("returns an interrupted job to the queue", async () => {
     // Without this, a worker that dies mid-job silently drops that repo.
@@ -204,6 +325,32 @@ describe("Worker failed-job management", () => {
     expect(new Queue(resolvePaths(state).queue).list()[0]?.attempts).toBe(0);
   });
 
+  it("parks a multi-line error on one line, without corrupting the fields after it", async () => {
+    // The failed/ file is one key=value per line; a raw stack trace would spill
+    // into keys of its own and push failed_at out of reach.
+    const w = makeWorker(
+      fakeProvider({ status: "failed", summary: "", error: "backend exited (code 1):\nfailed_at=bogus\n  at x" }),
+      { maxAttempts: 1 },
+    );
+    await w.runJob(enqueue());
+    const [parked] = w.listFailed();
+    expect(parked?.lastError).toBe("backend exited (code 1): | failed_at=bogus | at x");
+    expect(parked?.failedAt).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it("requeues a parked full reindex as full", async () => {
+    // park() used to drop full=1, so `retry` quietly downgraded it.
+    const w = makeWorker(fakeProvider({ status: "failed", summary: "", error: "x" }), {
+      maxAttempts: 1,
+    });
+    await w.runJob(enqueue({ full: true }));
+    expect(readFileSync(path.join(resolvePaths(state).failed, `${jobKey(repo)}.job`), "utf8")).toMatch(
+      /^full=1$/m,
+    );
+    expect(w.retryFailed()).toBe(1);
+    expect(new Queue(resolvePaths(state).queue).list()[0]?.full).toBe(true);
+  });
+
   it("forgets failed jobs without requeueing them", async () => {
     const w = makeWorker(fakeProvider({ status: "failed", summary: "", error: "x" }), {
       maxAttempts: 1,
@@ -227,6 +374,16 @@ describe("Worker.drain", () => {
     expect(results.filter((r) => r.outcome === "indexed")).toHaveLength(2);
     expect(q.size).toBe(0);
     rmSync(other, { recursive: true, force: true });
+  });
+
+  it("runs a failing job to its final outcome before moving on", async () => {
+    const provider = fakeProvider([
+      { status: "failed", summary: "", error: "transient" },
+      { status: "ok", summary: "done" },
+    ]);
+    enqueue();
+    const results = await makeWorker(provider).drain();
+    expect(results.map((r) => r.outcome)).toEqual(["indexed"]);
   });
 
   it("stops rather than spinning on a busy job", async () => {

@@ -19,7 +19,10 @@ export interface IndexRequest {
   /** Force complete re-discovery rather than an incremental update. */
   full: boolean;
   reason: IndexReason;
-  /** Abort signal so a hung backend can never wedge the queue. */
+  /**
+   * Lets an embedding caller give up early. The worker passes none: it relies on
+   * the provider's own session timeout to stop a hung backend.
+   */
   signal?: AbortSignal;
 }
 
@@ -32,6 +35,13 @@ export interface IndexOutcome {
   chunks?: number;
   /** Populated on failure; shown to the user verbatim. */
   error?: string;
+  /**
+   * False when trying again straight away cannot help, so the worker parks the
+   * job instead of spending its remaining attempts — for instance when the
+   * backend had to be killed and may still hold its lock on the project until
+   * that goes stale. Omitted means an ordinary failure, worth a retry.
+   */
+  retryable?: boolean;
 }
 
 export interface ProviderHealth {

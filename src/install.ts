@@ -42,8 +42,9 @@ export function dispatcherScript(binary = "codeindex-sync", enqueue = true): str
     ? `
 # 2. Enqueue, then kick a worker. Neither blocks: the drain is fully detached,
 # so git returns immediately, and indexing starts now rather than waiting for
-# the next scheduled tick. Concurrent drains are safe — the worker takes a lock
-# and any second one exits at once — so a burst of hooks still indexes once.
+# the next scheduled tick. Concurrent drains are safe — each drain takes the
+# worker lock and a second one exits at once — so a burst of hooks still
+# indexes once.
 if command -v ${binary} >/dev/null 2>&1; then
   ${binary} hook "\$hook_name" "\$@" >/dev/null 2>&1 || true
   ( nohup ${binary} drain >/dev/null 2>&1 & ) </dev/null >/dev/null 2>&1 || true

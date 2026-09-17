@@ -100,7 +100,10 @@ describe("isOurHooksDir", () => {
 describe("dispatcher behaviour in a real repo", () => {
   it("runs the repo's own hook and still exits 0", () => {
     const repo = mkdtempSync(path.join(tmpdir(), "codeindex-hookrepo-"));
-    const run = (args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "ignore" });
+    // Isolated from the developer's git config: a global hooksPath, signing or
+    // template directory would otherwise decide what this commit runs.
+    const env = { ...process.env, HOME: dir, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" };
+    const run = (args: string[]) => execFileSync("git", args, { cwd: repo, stdio: "ignore", env });
     run(["init", "-q", "-b", "main"]);
     run(["config", "user.email", "t@example.com"]);
     run(["config", "user.name", "T"]);

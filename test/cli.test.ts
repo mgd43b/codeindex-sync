@@ -11,24 +11,38 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { isAlive } from "../src/lock.js";
 import { Queue } from "../src/queue.js";
 import { metadataPointId } from "../src/verify.js";
+import { markRunning } from "../src/worker.js";
 
 const CLI = path.resolve("dist/cli.js");
 let home: string;
 let state: string;
 let cfgFile: string;
 
+/** Newest modification time under a directory, in ms. */
+function newestMtime(dir: string): number {
+  let newest = 0;
+  for (const entry of readdirSync(dir, { withFileTypes: true, recursive: true })) {
+    if (entry.isFile()) newest = Math.max(newest, statSync(path.join(entry.parentPath, entry.name)).mtimeMs);
+  }
+  return newest;
+}
+
+// These tests run the built CLI, so a dist older than src would test old code.
 beforeAll(() => {
-  if (!existsSync(CLI)) {
+  if (!existsSync(CLI) || statSync(CLI).mtimeMs < newestMtime(path.resolve("src"))) {
     execFileSync("npx", ["tsc", "-p", "tsconfig.json"], { stdio: "ignore" });
   }
 });
@@ -63,7 +77,7 @@ const BACKEND_ENV = [
   "QDRANT_MODE",
 ] as const;
 
-function cli(args: string[], env: Record<string, string> = {}, cwd?: string): Run {
+function cliEnv(): Record<string, string | undefined> {
   const childEnv: Record<string, string | undefined> = {
     ...process.env,
     HOME: home,
@@ -72,10 +86,14 @@ function cli(args: string[], env: Record<string, string> = {}, cwd?: string): Ru
     CODEINDEX_SYNC_CONFIG: cfgFile,
   };
   for (const key of BACKEND_ENV) delete childEnv[key];
+  return childEnv;
+}
+
+function cli(args: string[], env: Record<string, string> = {}, cwd?: string): Run {
   try {
     const out = execFileSync(process.execPath, [CLI, ...args], {
       encoding: "utf8",
-      env: { ...childEnv, ...env },
+      env: { ...cliEnv(), ...env },
       ...(cwd === undefined ? {} : { cwd }),
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -452,9 +470,11 @@ describe("list --all", () => {
     // too fast to observe reliably.
     const repo = mkdtempSync(path.join(tmpdir(), "codeindex-running-"));
     backendListing(repo);
-    // Written through Queue rather than by hand, so the test cannot drift from
-    // the on-disk format.
-    new Queue(path.join(state, "processing")).enqueue({ repoPath: repo, hook: "post-commit" });
+    // Written the way the worker writes it, naming a live process: this one.
+    markRunning(
+      path.join(state, "processing"),
+      new Queue(path.join(state, "queue")).enqueue({ repoPath: repo, hook: "post-commit" }),
+    );
     const out = cli(["list", "--all", "--json"]).out;
     const parsed = JSON.parse(out) as { projects: { path: string; state: string }[] };
     expect(parsed.projects[0]?.state).toBe("running");
@@ -568,6 +588,206 @@ describe("sync", () => {
     expect(second.out).toMatch(/unchanged/);
     expect(second.out).not.toMatch(/failed/);
     expect(second.code).toBe(0);
+  });
+
+  /**
+   * A backend whose first `failures` tool calls report an error, recording each
+   * call and each exit with its pid and time. State lives in a file because every
+   * attempt spawns a fresh child. `exitDelayMs` stretches its SIGTERM shutdown,
+   * as a backend finishing its in-flight batch does.
+   */
+  function flakyBackend(opts: { failures: number; exitDelayMs?: number; maxAttempts?: number }): {
+    dir: string;
+    events: () => { kind: string; pid: number; at: number }[];
+  } {
+    const log = path.join(home, "events.log");
+    const file = path.join(home, "flaky-server.mjs");
+    writeFileSync(
+      file,
+      `
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
+const log = ${JSON.stringify(log)};
+const record = (kind) => appendFileSync(log, kind + " " + process.pid + " " + Date.now() + "\\n");
+const callsSoFar = () =>
+  existsSync(log) ? readFileSync(log, "utf8").split("\\n").filter((l) => l.startsWith("call ")).length : 0;
+// Stop on SIGTERM or end of input, whichever comes first, as SocratiCode does.
+let stopping = false;
+const stop = () => {
+  if (stopping) return;
+  stopping = true;
+  setTimeout(() => { record("exit"); process.exit(0); }, ${opts.exitDelayMs ?? 0});
+};
+process.on("SIGTERM", stop);
+process.stdin.on("end", stop);
+const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+let buf = "";
+process.stdin.on("data", (c) => {
+  buf += c;
+  let n;
+  while ((n = buf.indexOf("\\n")) !== -1) {
+    const line = buf.slice(0, n).trim();
+    buf = buf.slice(n + 1);
+    if (!line) continue;
+    const m = JSON.parse(line);
+    if (m.method === "initialize") send({ jsonrpc: "2.0", id: m.id, result: {} });
+    if (m.method === "tools/call") {
+      const failing = callsSoFar() < ${opts.failures};
+      record("call");
+      send({
+        jsonrpc: "2.0",
+        id: m.id,
+        result: failing
+          ? { isError: true, content: [{ type: "text", text: "transient backend error" }] }
+          : { content: [{ type: "text", text: "Updated project index" }] },
+      });
+    }
+  }
+});
+`,
+      "utf8",
+    );
+    writeConfig({
+      root: home,
+      maxAttempts: opts.maxAttempts ?? 3,
+      backoffSeconds: 0,
+      providers: [
+        { name: "stub", command: process.execPath, args: [file], tools: { update: "u" }, detectFiles: [".stub.json"] },
+      ],
+    });
+    const dir = path.join(home, "flaky");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "user.email", "t@example.com");
+    git(dir, "config", "user.name", "Test");
+    writeFileSync(path.join(dir, ".stub.json"), '{"projectId":"flaky"}\n', "utf8");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "init");
+    const events = () =>
+      readFileSync(log, "utf8")
+        .split("\n")
+        .filter(Boolean)
+        .map((l) => {
+          const [kind = "", pid = "0", at = "0"] = l.split(" ");
+          return { kind, pid: Number(pid), at: Number(at) };
+        });
+    return { dir, events };
+  }
+
+  it("makes the retry it announces instead of exiting after the backoff", () => {
+    // Production: `[retry] … in 10s (attempt 1)` was logged with maxAttempts 3,
+    // then `sync` slept ten seconds and exited 1. No second attempt ever reached
+    // the backend.
+    const { dir, events } = flakyBackend({ failures: 1 });
+
+    const r = cli(["sync", dir]);
+
+    expect(events().filter((e) => e.kind === "call")).toHaveLength(2);
+    expect(r.out).toMatch(/Updated project index/);
+    expect(r.code).toBe(0);
+  }, 30_000);
+
+  it("starts the next attempt only after the previous backend has exited", () => {
+    // A backend still shutting down can still hold its project lock, and an
+    // attempt started beside it is refused that lock without being told.
+    const { dir, events } = flakyBackend({ failures: 1, exitDelayMs: 800 });
+
+    expect(cli(["sync", dir]).code).toBe(0);
+
+    const calls = events().filter((e) => e.kind === "call");
+    const firstExit = events().find((e) => e.kind === "exit" && e.pid === calls[0]?.pid);
+    expect(firstExit).toBeDefined();
+    expect(calls[1]!.at).toBeGreaterThanOrEqual(firstExit!.at);
+  }, 30_000);
+
+  it("parks the job after maxAttempts, says why, and lets it be forgotten", () => {
+    const { dir, events } = flakyBackend({ failures: 99, maxAttempts: 3 });
+
+    const r = cli(["sync", dir]);
+    expect(r.code).toBe(1);
+    expect(r.out).toMatch(/failed — transient backend error/);
+    expect(events().filter((e) => e.kind === "call")).toHaveLength(3);
+
+    const status = cli(["status"]).out;
+    expect(status).toMatch(/nothing queued/);
+    expect(status).toMatch(/transient backend error/);
+
+    expect(cli(["forget", "--all"]).out).toMatch(/dropped 1 job/);
+    expect(cli(["status"]).out).not.toMatch(/transient backend error/);
+  }, 60_000);
+
+  it("reports what `once` did, and fails the way sync does", () => {
+    // `once` used to print nothing and exit 0 whatever happened to the job.
+    const { dir } = flakyBackend({ failures: 99, maxAttempts: 1 });
+    new Queue(path.join(state, "queue")).enqueue({ repoPath: dir, hook: "post-commit" });
+
+    const r = cli(["once"]);
+    expect(r.out).toMatch(/failed — transient backend error/);
+    expect(r.code).toBe(1);
+  }, 30_000);
+
+  it("passes an interrupting signal on to the backend instead of orphaning it", async () => {
+    // Backends run in their own process group, which a terminal's Ctrl-C or a
+    // scheduler stopping the job does not reach. A backend that stops on a
+    // signal but not on end of input would otherwise outlive sync, holding its
+    // project lock.
+    const pidFile = path.join(home, "backend.pid");
+    const server = path.join(home, "hang-server.mjs");
+    writeFileSync(
+      server,
+      `
+import { writeFileSync } from "node:fs";
+writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+setInterval(() => {}, 1 << 30);
+let buf = "";
+process.stdin.on("data", (c) => {
+  buf += c;
+  let n;
+  while ((n = buf.indexOf("\\n")) !== -1) {
+    const line = buf.slice(0, n).trim();
+    buf = buf.slice(n + 1);
+    if (!line) continue;
+    const m = JSON.parse(line);
+    if (m.method === "initialize") process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: {} }) + "\\n");
+    // tools/call: never answer.
+  }
+});
+`,
+      "utf8",
+    );
+    writeConfig({
+      root: home,
+      providers: [
+        { name: "stub", command: process.execPath, args: [server], tools: { update: "u" }, detectFiles: [".stub.json"] },
+      ],
+    });
+    const dir = path.join(home, "interrupted");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    writeFileSync(path.join(dir, ".stub.json"), "{}\n", "utf8");
+
+    const sync = spawn(process.execPath, [CLI, "sync", dir], { env: cliEnv(), stdio: "ignore" });
+    const exited = new Promise((resolve) => sync.once("exit", resolve));
+    for (let i = 0; i < 400 && !existsSync(pidFile); i++) await new Promise((r) => setTimeout(r, 25));
+    const backend = Number(readFileSync(pidFile, "utf8"));
+    try {
+      sync.kill("SIGTERM");
+      await exited;
+      for (let i = 0; i < 100 && isAlive(backend); i++) await new Promise((r) => setTimeout(r, 20));
+      expect(isAlive(backend)).toBe(false);
+    } finally {
+      try {
+        process.kill(backend, "SIGKILL");
+      } catch {
+        // Already gone, as it should be.
+      }
+    }
+  }, 30_000);
+
+  it("asks what to forget rather than guessing", () => {
+    writeConfig({ providers: [] });
+    const r = cli(["forget"]);
+    expect(r.code).not.toBe(0);
+    expect(r.out).toMatch(/--all/);
   });
 });
 

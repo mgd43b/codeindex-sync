@@ -3,12 +3,23 @@
  *
  * Serialisation is deliberate. Indexing backends are typically GPU- or
  * network-bound singletons, so running several at once makes everything slower
- * and can exhaust the backend. One job at a time, with a lock, is the design.
+ * and can exhaust the backend. One job at a time is the design; the lock that
+ * enforces it across processes belongs to the `drain` command, not to this
+ * class, so a hand-run `sync` or `once` runs beside a drain rather than
+ * waiting for it.
  *
  * The behaviours here all come from failures observed in production:
  *
- *  - **Crash recovery.** Anything left in processing/ belongs to a worker that
- *    died mid-job and is returned to the queue, so no repo is silently dropped.
+ *  - **Crash recovery.** A job stays in queue/ until it succeeds or is parked,
+ *    so a worker that dies mid-job leaves it queued for the next one. While it
+ *    runs, a marker in processing/ names the job and the process running it;
+ *    a marker whose process is gone is cleared, and its job requeued if it is
+ *    somehow no longer queued, so no repo is silently dropped.
+ *  - **Retries happen in-process.** A failed attempt is retried after an
+ *    exponential backoff until `maxAttempts` is spent, by whichever command ran
+ *    it. The backoff starts only once the previous attempt's backend has exited,
+ *    because a backend still shutting down can still hold its project lock.
+ *    A failure the provider marks not retryable is parked at once.
  *  - **Busy is not failure.** Backends hold their own per-project lock. When
  *    another indexer has it, the job is requeued without burning an attempt —
  *    otherwise transient contention parks healthy repos in failed/.
@@ -23,7 +34,6 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -32,8 +42,9 @@ import { shouldCoalesce } from "./coalesce.js";
 import { fingerprint, serialiseFingerprint, unchanged } from "./fingerprint.js";
 import type { Logger } from "./logger.js";
 import type { Paths } from "./paths.js";
-import type { IndexProvider, ProviderRegistry } from "./provider.js";
-import { jobKey, nowIso, Queue, type Job } from "./queue.js";
+import { isAlive } from "./lock.js";
+import type { IndexOutcome, IndexProvider, ProviderRegistry } from "./provider.js";
+import { jobKey, nowIso, parseJob, Queue, serialiseJob, type Job } from "./queue.js";
 
 export interface WorkerOptions {
   paths: Paths;
@@ -56,7 +67,57 @@ export type JobResult =
   | { outcome: "failed"; error: string }
   | { outcome: "skipped"; reason: string };
 
+/** Every outcome but "retry", which `run` has already acted on. */
+export type FinalJobResult = Exclude<JobResult, { outcome: "retry" }>;
+
 const defaultSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** A job as it was when it failed for the last time. */
+export interface FailedJob extends Job {
+  lastError?: string;
+  failedAt?: string;
+}
+
+function markerFile(processingDir: string, repoPath: string): string {
+  return path.join(processingDir, `${jobKey(repoPath)}.job`);
+}
+
+function markerPid(text: string): number | undefined {
+  const pid = Number.parseInt(/^pid=(\d+)$/m.exec(text)?.[1] ?? "", 10);
+  return Number.isInteger(pid) ? pid : undefined;
+}
+
+/** Record that `pid` is running `job`, for `list --all` and crash recovery. */
+export function markRunning(processingDir: string, job: Job, pid = process.pid): void {
+  mkdirSync(processingDir, { recursive: true });
+  writeFileSync(markerFile(processingDir, job.repoPath), `${serialiseJob(job)}pid=${pid}\n`, "utf8");
+}
+
+/**
+ * Jobs a live process is running right now. A marker left by a process that has
+ * since died is not a running job, however recent it looks.
+ */
+export function runningJobs(processingDir: string): Job[] {
+  let names: string[];
+  try {
+    names = readdirSync(processingDir);
+  } catch {
+    return [];
+  }
+  const jobs: Job[] = [];
+  for (const name of names) {
+    if (!name.endsWith(".job")) continue;
+    try {
+      const text = readFileSync(path.join(processingDir, name), "utf8");
+      const pid = markerPid(text);
+      const job = parseJob(text);
+      if (job && pid !== undefined && isAlive(pid)) jobs.push(job);
+    } catch {
+      // Removed while being read: it finished.
+    }
+  }
+  return jobs;
+}
 
 export class Worker {
   private readonly queue: Queue;
@@ -112,24 +173,34 @@ export class Worker {
     writeFileSync(path.join(this.opts.paths.lastIndexed, jobKey(repoPath)), `${startedAt}\n`, "utf8");
   }
 
-  /** Return interrupted jobs to the queue. Run before draining. */
+  /**
+   * Clear markers left by processes that died mid-job, requeueing any job that
+   * is not already queued. Returns how many were requeued. Run before draining.
+   */
   recoverOrphans(): number {
+    const dir = this.opts.paths.processing;
     let recovered = 0;
     let names: string[];
     try {
-      names = readdirSync(this.opts.paths.processing);
+      names = readdirSync(dir);
     } catch {
       return 0;
     }
     for (const name of names) {
       if (!name.endsWith(".job")) continue;
+      const file = path.join(dir, name);
       try {
-        renameSync(
-          path.join(this.opts.paths.processing, name),
-          path.join(this.opts.paths.queue, name),
-        );
-        this.opts.logger.tag("recover", `requeued interrupted job ${name}`);
-        recovered++;
+        const text = readFileSync(file, "utf8");
+        const pid = markerPid(text);
+        // Still running somewhere else: not an orphan.
+        if (pid !== undefined && pid !== process.pid && isAlive(pid)) continue;
+        const job = parseJob(text);
+        if (job && !this.queue.list().some((q) => q.repoPath === job.repoPath)) {
+          this.queue.enqueue(job);
+          this.opts.logger.tag("recover", `requeued interrupted job ${name}`);
+          recovered++;
+        }
+        rmSync(file, { force: true });
       } catch {
         // Another worker recovered it first.
       }
@@ -137,15 +208,14 @@ export class Worker {
     return recovered;
   }
 
-  private park(job: Job, error: string): void {
-    const base = `${jobKey(job.repoPath)}.job`;
-    const dest = path.join(this.opts.paths.failed, base);
+  private park(job: Job, attempts: number, error: string): void {
+    const dest = path.join(this.opts.paths.failed, `${jobKey(job.repoPath)}.job`);
     try {
-      writeFileSync(
-        dest,
-        `repo_path=${job.repoPath}\nhook=${job.hook}\nenqueued_at=${job.enqueuedAt}\nattempts=${job.attempts}\nlast_error=${error}\nfailed_at=${nowIso()}\n`,
-        "utf8",
-      );
+      // The queue's own format, so a full reindex is still full when retried.
+      // One line per field, so a multi-line error cannot spill into the next.
+      const parked = serialiseJob({ ...job, attempts });
+      const oneLine = error.replace(/\s*\n\s*/g, " | ").trim();
+      writeFileSync(dest, `${parked}last_error=${oneLine}\nfailed_at=${nowIso()}\n`, "utf8");
     } catch {
       // Best effort: the log still records the give-up.
     }
@@ -206,11 +276,22 @@ export class Worker {
       `${job.repoPath} via ${provider.name} (attempt ${job.attempts + 1}/${this.maxAttempts}${job.full ? ", full" : ""})`,
     );
 
-    const result = await provider.index({
-      repoPath: job.repoPath,
-      full: job.full,
-      reason: job.attempts > 0 ? "retry" : job.hook === "manual" ? "manual" : "hook",
-    });
+    const marker = markerFile(this.opts.paths.processing, job.repoPath);
+    let result: IndexOutcome;
+    try {
+      try {
+        markRunning(this.opts.paths.processing, job);
+      } catch {
+        // Only `list --all` reads it; never fail a job over a marker.
+      }
+      result = await provider.index({
+        repoPath: job.repoPath,
+        full: job.full,
+        reason: job.attempts > 0 ? "retry" : job.hook === "manual" ? "manual" : "hook",
+      });
+    } finally {
+      rmSync(marker, { force: true });
+    }
 
     if (result.status === "busy") {
       // Contention, not failure: leave the job queued and do not burn an attempt.
@@ -228,9 +309,10 @@ export class Worker {
 
     const error = result.error ?? "unknown error";
     const attempts = job.attempts + 1;
-    if (attempts >= this.maxAttempts) {
-      logger.tag("give-up", `${job.repoPath} — parked after ${attempts} attempts: ${error}`);
-      this.park(job, error);
+    if (attempts >= this.maxAttempts || result.retryable === false) {
+      const why = result.retryable === false ? " (not retryable)" : "";
+      logger.tag("give-up", `${job.repoPath} — parked after ${attempts} attempts${why}: ${error}`);
+      this.park(job, attempts, error);
       return { outcome: "failed", error };
     }
 
@@ -241,7 +323,28 @@ export class Worker {
     return { outcome: "retry", attempt: attempts, error };
   }
 
-  /** Process until the queue is empty. Returns per-job results. */
+  /**
+   * Run a job to a final outcome, making every attempt it is allowed.
+   *
+   * `runJob` makes one attempt, and on a retryable failure requeues the job and
+   * sleeps out the backoff before returning "retry"; this loop is what makes
+   * the retry. It carries the job in memory rather than re-reading the queue
+   * file, because a hook may overwrite that file meanwhile with an incremental
+   * job whose attempts start again from zero — unbounded, and no longer full.
+   */
+  async run(job: Job): Promise<FinalJobResult> {
+    let current = job;
+    for (;;) {
+      const result = await this.runJob(current);
+      if (result.outcome !== "retry") return result;
+      current = { ...current, attempts: result.attempt };
+    }
+  }
+
+  /**
+   * Process until the queue is empty, a job is left busy, or `maxJobs` jobs have
+   * run. Each job is run to its final outcome before the next is picked.
+   */
   async drain(maxJobs = 1000): Promise<JobResult[]> {
     this.recoverOrphans();
     const results: JobResult[] = [];
@@ -249,22 +352,22 @@ export class Worker {
       const [job] = this.queue.list();
       if (!job) break;
       const before = this.queue.size;
-      results.push(await this.runJob(job));
+      results.push(await this.run(job));
       // A busy job stays queued by design; stop rather than spin on it.
       if (this.queue.size === before && results.at(-1)?.outcome === "busy") break;
     }
     return results;
   }
 
-  /** Process exactly one job, if any. */
-  async once(): Promise<JobResult | null> {
+  /** Process exactly one job, if any, to its final outcome. */
+  async once(): Promise<FinalJobResult | null> {
     this.recoverOrphans();
     const [job] = this.queue.list();
     if (!job) return null;
-    return this.runJob(job);
+    return this.run(job);
   }
 
-  listFailed(): Job[] {
+  listFailed(): FailedJob[] {
     const dir = this.opts.paths.failed;
     let names: string[];
     try {
@@ -272,21 +375,21 @@ export class Worker {
     } catch {
       return [];
     }
-    const jobs: Job[] = [];
+    const jobs: FailedJob[] = [];
     for (const name of names) {
       if (!name.endsWith(".job")) continue;
       try {
         const text = readFileSync(path.join(dir, name), "utf8");
+        const job = parseJob(text);
+        if (!job) continue;
         const get = (k: string): string | undefined =>
           text.split("\n").find((l) => l.startsWith(`${k}=`))?.slice(k.length + 1);
-        const repoPath = get("repo_path");
-        if (!repoPath) continue;
+        const lastError = get("last_error");
+        const failedAt = get("failed_at");
         jobs.push({
-          repoPath,
-          hook: get("hook") ?? "manual",
-          enqueuedAt: get("enqueued_at") ?? "",
-          full: get("full") === "1",
-          attempts: Number.parseInt(get("attempts") ?? "0", 10) || 0,
+          ...job,
+          ...(lastError === undefined ? {} : { lastError }),
+          ...(failedAt === undefined ? {} : { failedAt }),
         });
       } catch {
         // Skip unreadable entries.

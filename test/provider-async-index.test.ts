@@ -18,10 +18,11 @@
  *    lock first. A single "are you done yet?" lands in that window and sees an
  *    idle backend, so polling once and believing the answer is not a fix.
  */
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { findPreset } from "../src/presets.js";
 import { McpIndexProvider, type McpProviderConfig } from "../src/providers/mcp-provider.js";
 
 let dir: string;
@@ -75,6 +76,13 @@ const PREVIOUS = [
   "  Files: 3, Chunks: 5",
 ].join("\n");
 
+/**
+ * A status tool that threw. SocratiCode 1.14.0 answers this way when Qdrant
+ * returns 500 for a collection its own index is still creating.
+ */
+const STATUS_READ_FAILED =
+  "getCollectionInfo(collection=codebase_stub) failed [status 500]: Internal Server Error";
+
 /** What a backend says when it has never heard of the project. */
 const NO_INDEX = "No index found for project: /repo\nRun index to create one.";
 
@@ -89,6 +97,26 @@ interface StubOptions {
   background?: boolean;
   /** Status before the run becomes visible. Defaults to "never heard of it". */
   idleStatus?: string;
+  /**
+   * How many status polls are answered with a tool error instead — the
+   * backend's own read failing while its index keeps running.
+   */
+  statusErrors?: number;
+  /**
+   * When those errors start: from the very first poll, or only once the run has
+   * been reported in progress. Production saw both orderings.
+   */
+  statusErrorsFrom?: "start" | "running";
+  /** Status calls (1-based) answered with a tool error, whatever the phase. */
+  statusErrorCalls?: number[];
+  /** How long the simulated run takes once visible. Defaults to INDEX_MS. */
+  indexMs?: number;
+  /** Exit the process on this status call (1-based), as a crashing backend would. */
+  exitOnStatusCall?: number;
+  /** Written to stderr just before that exit. */
+  stderrBeforeExit?: string;
+  /** Ignore SIGTERM, as a backend wedged in its shutdown would. */
+  ignoreSigterm?: boolean;
 }
 
 /**
@@ -105,8 +133,15 @@ function stubServer(opts: StubOptions = {}): string {
     finalStatus: opts.finalStatus === undefined ? COMPLETED : opts.finalStatus,
     background: opts.background ?? true,
     idleStatus: opts.idleStatus ?? NO_INDEX,
+    statusErrors: opts.statusErrors ?? 0,
+    statusErrorsFrom: opts.statusErrorsFrom ?? "running",
+    statusErrorText: STATUS_READ_FAILED,
+    statusErrorCalls: opts.statusErrorCalls ?? [],
+    exitOnStatusCall: opts.exitOnStatusCall ?? 0,
+    stderrBeforeExit: opts.stderrBeforeExit ?? "",
+    ignoreSigterm: opts.ignoreSigterm ?? false,
     startupMs: STARTUP_MS,
-    indexMs: INDEX_MS,
+    indexMs: opts.indexMs ?? INDEX_MS,
     inProgress: IN_PROGRESS,
   });
   writeFileSync(
@@ -118,6 +153,14 @@ const sessionLog = process.argv[2];
 
 // Per-process, like a real backend's progress map: a second child sees "idle".
 let phase = "idle";
+let reportedRunning = false;
+let statusErrorsSent = 0;
+let statusCalls = 0;
+if (cfg.ignoreSigterm) {
+  // Wedged: neither the signal nor end of input stops it.
+  process.on("SIGTERM", () => {});
+  setInterval(() => {}, 1 << 30);
+}
 
 function begin() {
   if (!cfg.background) return;
@@ -148,7 +191,10 @@ process.stdin.on("data", (c) => {
   }
 });
 const send = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
-const text = (id, t) => send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: t }] } });
+// Replies echo the project path, as a real backend's do.
+let projectPath = "/repo";
+const text = (id, t) =>
+  send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: t.split("/repo").join(projectPath) }] } });
 
 function handle(msg) {
   if (msg.method === "initialize") {
@@ -157,10 +203,27 @@ function handle(msg) {
     return send({ jsonrpc: "2.0", id: msg.id, result: {} });
   }
   if (msg.method !== "tools/call") return;
+  projectPath = msg.params?.arguments?.projectPath ?? projectPath;
   const name = msg.params?.name;
   if (name === "i") { begin(); return text(msg.id, cfg.indexReply); }
   if (name === "u") { begin(); return text(msg.id, cfg.updateReply); }
-  if (name === "s") return text(msg.id, statusText());
+  if (name === "s") {
+    statusCalls++;
+    if (statusCalls === cfg.exitOnStatusCall) {
+      if (!cfg.stderrBeforeExit) process.exit(3);
+      return process.stderr.write(cfg.stderrBeforeExit + "\\n", () => process.exit(3));
+    }
+    if (cfg.statusErrorCalls.includes(statusCalls)) {
+      return send({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: cfg.statusErrorText }] } });
+    }
+    const erring = cfg.statusErrorsFrom === "start" || (phase === "running" && reportedRunning);
+    if (erring && statusErrorsSent < cfg.statusErrors) {
+      statusErrorsSent++;
+      return send({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: cfg.statusErrorText }] } });
+    }
+    if (phase === "running") reportedRunning = true;
+    return text(msg.id, statusText());
+  }
   return send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "no such tool: " + name } });
 }
 `,
@@ -373,5 +436,188 @@ describe("the incremental path", () => {
     expect(got.status).toBe("ok");
     expect(got.chunks).toBe(40);
     expect(sessionCount()).toBe(1);
+  });
+});
+
+describe("a status poll that fails while the index runs", () => {
+  it("keeps waiting through a one-off status error instead of abandoning the run", async () => {
+    // Production: a poll landed while the backend was still creating its
+    // collection, the status tool threw once, and the run was reported failed —
+    // closing the session, killing the index, and leaving an empty, in-progress
+    // collection behind.
+    const p = providerFor(stubServer({ statusErrors: 1 }));
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+
+    expect(got.error).toBeUndefined();
+    expect(got.status).toBe("ok");
+    expect(got.chunks).toBe(40);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("keeps waiting when the status errors come before any progress was seen", async () => {
+    // The other production ordering: the collection is created before a poll
+    // has had the chance to see progress, so tolerance cannot hinge on it.
+    const p = providerFor(stubServer({ statusErrors: 3, statusErrorsFrom: "start" }));
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+
+    expect(got.error).toBeUndefined();
+    expect(got.status).toBe("ok");
+    expect(got.chunks).toBe(40);
+  });
+
+  it("starts the tolerance window afresh after a clean reply between errors", async () => {
+    // A long index can trip twice, far apart. Timing the second error from the
+    // first would abandon a healthy run — the original failure, later on.
+    // Each poll sleeps at least POLL_MS, so call 20 lands well past the 320ms
+    // window after call 2, while the 2s run is still going.
+    const p = providerFor(stubServer({ statusErrorCalls: [2, 20], indexMs: 2_000 }));
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+
+    expect(got.error).toBeUndefined();
+    expect(got.status).toBe("ok");
+    expect(got.chunks).toBe(40);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("fails once the status tool has kept failing for the settle window", async () => {
+    // Bounded: a status tool that never recovers must fail in seconds, not sit
+    // out a session timeout sized for a day-long index.
+    const p = providerFor(stubServer({ statusErrors: 1e9, statusErrorsFrom: "start" }));
+    const t0 = Date.now();
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+
+    expect(got.status).toBe("failed");
+    expect(got.error).toMatch(/kept failing/);
+    expect(got.error).toContain("[status 500]");
+    // The window is POLL_MS * 8 = 320ms; the session timeout is 20s.
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(POLL_MS * 8);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+  });
+
+  it("fails at once when the backend dies mid-poll, rather than polling a dead session", async () => {
+    // A 2s interval gives a 16s tolerance window, so only a fail-fast path can
+    // finish inside the assertion below.
+    const p = providerFor(stubServer({ exitOnStatusCall: 2 }), { pollIntervalMs: 2_000 });
+    const t0 = Date.now();
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+
+    expect(got.status).toBe("failed");
+    expect(got.error).toMatch(/exited/);
+    expect(Date.now() - t0).toBeLessThan(5_000);
+    expect(sessionCount()).toBe(1);
+  });
+
+  it("reports a backend that crashed as failed, even if its last stderr mentions being busy", async () => {
+    // The exit error quotes the child's stderr. Read as a reply, "server busy"
+    // made a crash look like contention: never counted as failed, exit 0.
+    const p = providerFor(
+      stubServer({ exitOnStatusCall: 2, stderrBeforeExit: "warn: server busy, please try again" }),
+      { busyMarkers: ["BUSY"] },
+    );
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+
+    expect(got.status).toBe("failed");
+    expect(got.error).toMatch(/code 3/);
+    expect(got.error).toContain("server busy");
+  });
+
+  it("still matches a marker that ends in punctuation, such as \"BUSY:\"", async () => {
+    // Word boundaries apply only at a marker's word-character edges.
+    const p = providerFor(
+      stubServer({ updateReply: "BUSY:held by another writer", background: false }),
+      { busyMarkers: ["BUSY:"] },
+    );
+    const got = await p.index({ repoPath: dir, full: false, reason: "hook" });
+    expect(got.status).toBe("busy");
+  });
+
+  it("does not mistake a busy-sounding collection name for contention", async () => {
+    // Stripping the path is not enough: status names the collection after it.
+    const p = providerFor(stubServer({ finalStatus: COMPLETED.replace("codebase_stub", "codebase_busybox") }), {
+      busyMarkers: ["BUSY"],
+    });
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+    expect(got.status).toBe("ok");
+  });
+
+  it("recognises SocratiCode's reply when another process holds the project, with the preset's markers", async () => {
+    // What a contended codebase_update actually returns: an ordinary reply with
+    // the skip buried in its progress lines. Read as success, the update was
+    // recorded as done and never retried.
+    const preset = findPreset("socraticode")!.config;
+    const p = providerFor(
+      stubServer({
+        updateReply: [
+          "Updated project index for: /repo",
+          "Added: 0, Updated: 0, Removed: 0",
+          "Progress:",
+          "Another process is already indexing this project, skipping",
+        ].join("\n"),
+        background: false,
+      }),
+      { busyMarkers: preset.busyMarkers },
+    );
+    const got = await p.index({ repoPath: dir, full: false, reason: "hook" });
+    expect(got.status).toBe("busy");
+  });
+
+  it("does not mistake a busy-sounding project path for contention", async () => {
+    // Replies echo the path; a repository called busybox is not a held lock.
+    const repo = path.join(dir, "busybox");
+    mkdirSync(repo);
+    const p = providerFor(stubServer(), { busyMarkers: ["BUSY"] });
+    const got = await p.index({ repoPath: repo, full: true, reason: "manual" });
+
+    expect(got.status).toBe("ok");
+    expect(got.chunks).toBe(40);
+  });
+
+  it("fails at once when the server rejects the status call itself", async () => {
+    // An unknown tool name is a configuration mistake, not a transient error.
+    const p = providerFor(stubServer(), {
+      pollIntervalMs: 2_000,
+      tools: { update: "u", index: "i", status: "not-a-tool" },
+    });
+    const t0 = Date.now();
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+
+    expect(got.status).toBe("failed");
+    expect(got.error).toMatch(/no such tool/);
+    expect(Date.now() - t0).toBeLessThan(5_000);
+  });
+});
+
+describe("whether a failure is worth retrying straight away", () => {
+  it("marks an ordinary failure retryable", async () => {
+    const p = providerFor(stubServer({ finalStatus: NO_INDEX }));
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+    expect(got.status).toBe("failed");
+    expect(got.retryable).toBeUndefined();
+  });
+
+  it("keeps a timed-out run retryable once its backend has exited", async () => {
+    // The backend exited in time, so nothing of it is left holding the project;
+    // one that checkpoints resumes on the next attempt rather than starting over.
+    const p = providerFor(stubServer({ finalStatus: null }), { timeoutMs: 600 });
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+    expect(got.status).toBe("failed");
+    expect(got.error).toMatch(/timed out/);
+    expect(got.retryable).toBeUndefined();
+  });
+
+  it("marks a run whose backend had to be killed not retryable", async () => {
+    // A killed backend's project lock outlives it until it goes stale, so an
+    // attempt started now would be refused it and fail for an unrelated reason.
+    // An ordinary failure (no index after the settle window), not a timeout:
+    // only the kill can make it unretryable.
+    const p = providerFor(stubServer({ finalStatus: NO_INDEX, ignoreSigterm: true }), {
+      killAfterMs: 300,
+    });
+    const t0 = Date.now();
+    const got = await p.index({ repoPath: dir, full: true, reason: "manual" });
+    expect(got.status).toBe("failed");
+    expect(got.error).toMatch(/no index/);
+    expect(got.retryable).toBe(false);
+    expect(Date.now() - t0).toBeLessThan(10_000);
   });
 });

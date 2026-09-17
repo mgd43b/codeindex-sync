@@ -22,6 +22,14 @@
  * index call claimed. The polling happens on ONE session, because progress is
  * typically per-process state: a second child would see a backend that has
  * never indexed anything, and the first child is dead by then anyway.
+ *
+ * A status read that fails is not evidence about the index. Early polls land
+ * while the backend is still setting up — creating the storage it is about to
+ * fill — and a backend's own read of half-created storage can fail while its
+ * index carries on regardless. Abandoning the run over that would close the
+ * session and kill the very work being waited on. So a status tool that reports
+ * an error is polled again, for a bounded time; a session that died, timed out
+ * or refused the request is not, because nothing more can be learned from it.
  */
 import { existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -99,16 +107,13 @@ export interface McpProviderConfig {
   progressMarkers?: string[];
   /** Gap between `status` polls while waiting for an async tool to finish. */
   pollIntervalMs?: number;
+  /**
+   * How long a backend asked to stop may take to exit before it is killed.
+   * Defaults to 75s (`DEFAULT_KILL_AFTER_MS` in mcp.ts); see `McpSession.close`.
+   */
+  killAfterMs?: number;
 }
 
-/**
- * A directory that definitely exists, preferring `wanted`.
- *
- * Spawning with a cwd that has been deleted fails during interpreter startup
- * with an opaque `uv_cwd ENOENT`, long before the backend gets a chance to
- * report anything useful. Deleted directories are routine here: throwaway
- * worktrees, and `cleanup`, whose entire input is paths that no longer exist.
- */
 /**
  * Parse a backend's project listing.
  *
@@ -164,6 +169,14 @@ export function parseProjectListing(text: string): IndexedProject[] {
   return out.filter((p) => (seen.has(p.path) ? false : (seen.add(p.path), true)));
 }
 
+/**
+ * A directory that definitely exists, preferring `wanted`.
+ *
+ * Spawning with a cwd that has been deleted fails during interpreter startup
+ * with an opaque `uv_cwd ENOENT`, long before the backend gets a chance to
+ * report anything useful. Deleted directories are routine here: throwaway
+ * worktrees, and `cleanup`, whose entire input is paths that no longer exist.
+ */
 function safeCwd(wanted?: string): string {
   const candidates = [wanted, process.cwd(), homedir(), tmpdir()].filter(
     (c): c is string => typeof c === "string" && c.length > 0,
@@ -192,7 +205,17 @@ function samePath(a: string, b: string): boolean {
   return path.normalize(a).replace(/\/+$/, "") === path.normalize(b).replace(/\/+$/, "");
 }
 
-const DEFAULT_BUSY_MARKERS = ["another indexer", "already in progress", "locked by", "BUSY"];
+/**
+ * Replies meaning another indexer holds the project. Matched as whole words, so
+ * a bare word like "busy" would still hit a file name such as `busy-hours.json`
+ * in a progress listing; phrases are what a backend actually says.
+ */
+const DEFAULT_BUSY_MARKERS = [
+  "another indexer",
+  "already in progress",
+  "already indexing this project",
+  "locked by",
+];
 
 /**
  * A reply that means "started, not finished". Matched against the index tool's
@@ -210,6 +233,12 @@ const DEFAULT_ASYNC_INDEX_MARKERS = [
  * here because a backend may report that *another* process holds the job —
  * waiting for that to finish is right, and returning "done" while it runs is
  * exactly the empty-index failure this polling exists to prevent.
+ *
+ * Seen from a fresh session, that other process has usually taken this run's
+ * place: a backend that finds its lock held skips the work it just reported
+ * starting, so the outcome is whatever the other writer leaves behind. Our own
+ * previous child is never that writer, because a session is not closed until
+ * its child — and anything holding its pipes — is gone (see `McpSession.close`).
  */
 const DEFAULT_PROGRESS_MARKERS = ["in progress", "in-progress", "actively indexing"];
 
@@ -235,8 +264,31 @@ const SETTLE_INTERVALS = 8;
  * unseen run cannot be told apart from one that never started. Polls therefore
  * begin immediately and back off to the configured cadence, which is cheap
  * where it matters and unobtrusive once the job is clearly long-running.
+ *
+ * Those early polls are also the ones most likely to land inside the backend's
+ * own setup and come back as a status-tool error, which is why such errors are
+ * ridden out rather than believed (see `awaitCompletion`).
  */
 const MIN_POLL_MS = 100;
+
+/**
+ * Does any marker appear as a whole word or phrase, case-insensitively?
+ *
+ * Whole words because the text these are tested against names things — a
+ * collection `codebase_busybox`, a stack trace's `EBUSY` — and a marker found
+ * inside a name is not the backend saying anything.
+ */
+function containsPhrase(text: string, markers: readonly string[]): boolean {
+  const wordChar = /[\p{L}\p{N}_]/u;
+  return markers.some((m) => {
+    const escaped = m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    // A boundary only where the marker itself starts or ends with a word
+    // character: "BUSY:" must still match "BUSY:locked".
+    const before = wordChar.test(m.at(0) ?? "") ? "(?<![\\p{L}\\p{N}_])" : "";
+    const after = wordChar.test(m.at(-1) ?? "") ? "(?![\\p{L}\\p{N}_])" : "";
+    return new RegExp(`${before}${escaped}${after}`, "iu").test(text);
+  });
+}
 
 function matchesAny(text: string, markers: readonly string[]): boolean {
   const hay = text.toLowerCase();
@@ -299,8 +351,20 @@ export class McpIndexProvider implements IndexProvider {
     return { [this.cfg.repoArg ?? "projectPath"]: repoPath, ...extra };
   }
 
-  private isBusy(text: string): boolean {
-    return matchesAny(text, this.cfg.busyMarkers ?? DEFAULT_BUSY_MARKERS);
+  /**
+   * Does this reply say another indexer holds the project?
+   *
+   * Only a reply the backend actually gave counts. A session that could not
+   * start, died or timed out said nothing about contention — and its text
+   * carries the child's stderr, where "server busy" would otherwise turn a crash
+   * into a job that is never counted as failed. Markers match whole words only,
+   * after the project's own path is taken out, because replies echo that path
+   * and names derived from it, and a repository may well be called `busybox`.
+   */
+  private isBusy(res: McpToolResult, repoPath: string): boolean {
+    if (res.failure !== undefined && res.failure !== "protocol") return false;
+    const text = res.text.split(repoPath).join("");
+    return containsPhrase(text, this.cfg.busyMarkers ?? DEFAULT_BUSY_MARKERS);
   }
 
   /**
@@ -334,6 +398,7 @@ export class McpIndexProvider implements IndexProvider {
       cwd: safeCwd(repoPath),
       env: { ...process.env, SOCRATICODE_AUTO_RESUME: "off", ...this.cfg.env },
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
+      ...(this.cfg.killAfterMs === undefined ? {} : { killAfterMs: this.cfg.killAfterMs }),
     };
   }
 
@@ -349,6 +414,7 @@ export class McpIndexProvider implements IndexProvider {
     const indexTool = req.full ? this.cfg.tools.index : undefined;
     const tool = indexTool ?? this.cfg.tools.update;
     let res: McpToolResult;
+    let used: McpSession | undefined;
     try {
       // One session for the tool call AND the polling that confirms it
       // finished. Not two: a backend's progress state is per-process, so a
@@ -356,8 +422,9 @@ export class McpIndexProvider implements IndexProvider {
       res = await withMcp(
         this.sessionOpts(req.repoPath, this.cfg.timeoutMs),
         async (session) => {
+          used = session;
           const started = await session.callTool(tool, this.repoArgs(req.repoPath));
-          if (started.isError || this.isBusy(started.text)) return started;
+          if (started.isError || this.isBusy(started, req.repoPath)) return started;
           return this.awaitCompletion(session, req, started, indexTool !== undefined);
         },
       );
@@ -369,11 +436,28 @@ export class McpIndexProvider implements IndexProvider {
       };
     }
 
-    if (this.isBusy(res.text)) {
+    if (this.isBusy(res, req.repoPath)) {
       return { status: "busy", summary: firstMeaningfulLine(res.text) };
     }
     if (res.isError) {
-      return { status: "failed", summary: "", error: firstMeaningfulLine(res.text) || res.text };
+      const failed: IndexOutcome = {
+        status: "failed",
+        summary: "",
+        // A dead session's text is our own account — exit code or signal — then
+        // whatever the child last wrote to stderr. Picking one "meaningful" line
+        // from that lands on a stack frame, so keep it whole, on one line.
+        error:
+          res.failure === undefined || res.failure === "protocol"
+            ? firstMeaningfulLine(res.text) || res.text
+            : res.text.replace(/\s*\n\s*/g, " | ").trim(),
+      };
+      // A child that had to be killed leaves its lock on the project behind until
+      // the backend's staleness rule frees it, so an attempt started now would be
+      // refused it and fail for a reason unrelated to the first. A timeout on its
+      // own is still worth retrying once the child has exited: a backend that
+      // checkpoints resumes where the last attempt stopped.
+      if (used?.forcedKill) failed.retryable = false;
+      return failed;
     }
 
     const outcome: IndexOutcome = { status: "ok", summary: firstMeaningfulLine(res.text) };
@@ -400,10 +484,18 @@ export class McpIndexProvider implements IndexProvider {
    * be called finished; only a reply that promised nothing may be confirmed
    * straight from an index that already exists.
    *
-   * The wait is bounded by the caller's abort signal and by the session's own
-   * hard timer, which kills the child and makes every later call fail at once.
-   * Both end as a failure — a backend that never finishes must never look like
-   * one that did.
+   * A status tool that answers with an error is not a verdict either way. Its
+   * backend is alive and its index may be running — the error can be the
+   * backend's own read tripping over storage it is creating that moment — so it
+   * is polled again until it answers cleanly, for up to the settle window
+   * measured from the first error in an unbroken run of them. Only a status
+   * that keeps failing for that long ends the wait. A session that died, timed
+   * out or rejected the call ends it at once.
+   *
+   * Otherwise the wait is bounded by the session's hard timer, which ends the
+   * session and makes every later call fail at once, and by the caller's abort
+   * signal when there is one. Both end as a failure — a backend that never
+   * finishes must never look like one that did.
    */
   private async awaitCompletion(
     session: McpSession,
@@ -424,10 +516,12 @@ export class McpIndexProvider implements IndexProvider {
 
     const progressMarkers = this.cfg.progressMarkers ?? DEFAULT_PROGRESS_MARKERS;
     const interval = this.cfg.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-    // Never sleep past the session's own ceiling: a long poll interval must not
-    // outlive the child it is waiting on.
+    // Caps each sleep so a long poll interval cannot outlive the child. Counted
+    // from here rather than from the session's start, so it errs late; the loop
+    // never ends on it — the session timer's own failure reply does that.
     const deadline = Date.now() + (this.cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-    const settleUntil = Date.now() + interval * SETTLE_INTERVALS;
+    const settleWindow = interval * SETTLE_INTERVALS;
+    const settleUntil = Date.now() + settleWindow;
 
     /** Accept a settled reply, unless the backend disowns its own index. */
     const finish = (res: McpToolResult): McpToolResult =>
@@ -439,31 +533,48 @@ export class McpIndexProvider implements IndexProvider {
 
     let sawProgress = false;
     let backoff = Math.min(MIN_POLL_MS, interval);
+    /** When the current unbroken run of status-tool errors began. */
+    let failingSince: number | undefined;
 
     for (;;) {
       const now = await session.callTool(statusTool, this.repoArgs(req.repoPath));
-      // The session died or timed out. Reporting that is the whole point.
-      if (now.isError) return now;
 
-      const running = matchesAny(now.text, progressMarkers);
-      if (running) sawProgress = true;
+      if (now.isError) {
+        // The session died, timed out or refused the call: nothing more can be
+        // learned from it, and reporting that is the whole point.
+        if (now.failure) return now;
+        // The status tool itself failed. Not evidence about the index; ask
+        // again, unless it has been failing for longer than the settle window.
+        failingSince ??= Date.now();
+        const failingFor = Date.now() - failingSince;
+        if (failingFor >= settleWindow) {
+          return {
+            isError: true,
+            text: `${statusTool} kept failing for ${Math.round(failingFor / 1000)}s: ${now.text}`,
+          };
+        }
+      } else {
+        failingSince = undefined;
+        const running = matchesAny(now.text, progressMarkers);
+        if (running) sawProgress = true;
 
-      if (!running && (sawProgress || !asyncReply) && looksIndexed(now.text)) {
-        return finish(now);
-      }
+        if (!running && (sawProgress || !asyncReply) && looksIndexed(now.text)) {
+          return finish(now);
+        }
 
-      // Never saw the work start. Believe an index that exists — a very fast
-      // run can finish between polls — but a backend that reports none after
-      // being told to build one has failed, however cheerful its reply was.
-      if (!running && Date.now() >= settleUntil) {
-        return looksIndexed(now.text)
-          ? finish(now)
-          : {
-              isError: true,
-              text: `${statusTool} still reports no index after running ${
-                usedIndexTool ? (this.cfg.tools.index ?? "index") : this.cfg.tools.update
-              }`,
-            };
+        // Never saw the work start. Believe an index that exists — a very fast
+        // run can finish between polls — but a backend that reports none after
+        // being told to build one has failed, however cheerful its reply was.
+        if (!running && Date.now() >= settleUntil) {
+          return looksIndexed(now.text)
+            ? finish(now)
+            : {
+                isError: true,
+                text: `${statusTool} still reports no index after running ${
+                  usedIndexTool ? (this.cfg.tools.index ?? "index") : this.cfg.tools.update
+                }`,
+              };
+        }
       }
 
       await sleep(Math.min(backoff, Math.max(0, deadline - Date.now())), req.signal);
@@ -497,11 +608,12 @@ export class McpIndexProvider implements IndexProvider {
   /**
    * Every project this backend holds an index for.
    *
-   * Parsing is deliberately generic: any "list projects" tool prints paths, so
-   * lines that are *just* a path (optionally bulleted) are taken and everything
-   * else ignored. That tolerates differing formats without teaching this class
-   * about any particular backend. A path containing a newline would be missed;
-   * no filesystem in practice has one.
+   * Parsing is deliberately generic — see `parseProjectListing`: a line that is
+   * just a path (optionally bulleted) starts a record, indented `Key: value`
+   * lines under it fill in its details, and anything else is ignored. That
+   * tolerates differing formats without teaching this class about any
+   * particular backend. A path containing a newline would be missed; no
+   * filesystem in practice has one.
    */
   async projects(): Promise<IndexedProject[] | null> {
     const tool = this.cfg.tools.list;

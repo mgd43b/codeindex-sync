@@ -63,6 +63,7 @@ import {
   scheduleInstalled,
 } from "./schedule.js";
 import { ProviderRegistry } from "./provider.js";
+import { forwardSignalsToBackends } from "./mcp.js";
 import { McpIndexProvider, type McpProviderConfig } from "./providers/mcp-provider.js";
 import { Qdrant, QdrantError, resolveQdrantConfig } from "./qdrant.js";
 import { Queue, nowIso } from "./queue.js";
@@ -78,7 +79,7 @@ import {
   type VerifyReport,
 } from "./verify.js";
 import { VERSION } from "./version.js";
-import { Worker } from "./worker.js";
+import { runningJobs, Worker, type FinalJobResult } from "./worker.js";
 
 function config(): Config {
   try {
@@ -362,7 +363,13 @@ program
     const failed = workerFrom(cfg).listFailed();
     if (failed.length) {
       ui.heading("Failed");
-      ui.table(failed.map((j) => [ui.style.red(path.basename(j.repoPath)), j.repoPath]));
+      ui.table(
+        failed.map((j) => [
+          ui.style.red(path.basename(j.repoPath)),
+          j.failedAt ? ui.relativeTime(j.failedAt) : "",
+          oneLine(j.lastError ?? "no error recorded"),
+        ]),
+      );
       ui.line();
       ui.line(`  ${ui.style.dim("retry:")} ${ui.style.cyan("codeindex-sync retry")}`);
     }
@@ -888,38 +895,46 @@ program
     const worker = workerFrom(cfg, true);
     const queue = new Queue(resolvePaths().queue);
     const job = queue.enqueue({ repoPath: target, hook: "manual", full: opts.full });
-    const result = await worker.runJob(job);
-    ui.line();
-    // Exhaustive on purpose. A catch-all here once turned `unchanged` — the
-    // commonest outcome of all — into "failed — unknown" with exit 1, so a
-    // scheduled sync of a quiet repository failed on every run.
-    switch (result.outcome) {
-      case "indexed":
-        ui.ok(result.summary || "indexed");
-        break;
-      case "coalesced":
-        ui.info(`skipped — ${result.reason}`);
-        break;
-      case "unchanged":
-        ui.info("unchanged — HEAD has not moved and the tree is clean; nothing to index");
-        break;
-      case "busy":
-        ui.warn("backend is already indexing this repo; job left queued");
-        break;
-      case "skipped":
-        ui.warn(`skipped — ${result.reason}`);
-        break;
-      case "retry":
-      case "failed":
-        ui.bad(`failed — ${result.error}`);
-        process.exitCode = 1;
-        break;
-      default: {
-        const unhandled: never = result;
-        throw new Error(`unhandled job outcome: ${JSON.stringify(unhandled)}`);
-      }
-    }
+    // Every attempt maxAttempts allows, not just the first: a single attempt
+    // announced "[retry] … in 10s", slept, and exited 1 with nothing retried.
+    reportOutcome(await worker.run(job));
   });
+
+/**
+ * Print a job's final outcome, and exit non-zero only for a real failure.
+ *
+ * Exhaustive on purpose. A catch-all here once turned `unchanged` — the
+ * commonest outcome of all — into "failed — unknown" with exit 1, so a
+ * scheduled sync of a quiet repository failed on every run.
+ */
+function reportOutcome(result: FinalJobResult): void {
+  ui.line();
+  switch (result.outcome) {
+    case "indexed":
+      ui.ok(result.summary || "indexed");
+      break;
+    case "coalesced":
+      ui.info(`skipped — ${result.reason}`);
+      break;
+    case "unchanged":
+      ui.info("unchanged — HEAD has not moved and the tree is clean; nothing to index");
+      break;
+    case "busy":
+      ui.warn("backend is already indexing this repo; job left queued");
+      break;
+    case "skipped":
+      ui.warn(`skipped — ${result.reason}`);
+      break;
+    case "failed":
+      ui.bad(`failed — ${result.error}`);
+      process.exitCode = 1;
+      break;
+    default: {
+      const unhandled: never = result;
+      throw new Error(`unhandled job outcome: ${JSON.stringify(unhandled)}`);
+    }
+  }
+}
 
 // ── drain / once ──────────────────────────────────────────────────────────
 program
@@ -965,6 +980,7 @@ program
     requireProviders(cfg);
     const result = await workerFrom(cfg, true).once();
     if (!result) ui.empty("queue was empty");
+    else reportOutcome(result);
   });
 
 // ── retry / forget / unlock ───────────────────────────────────────────────
@@ -979,11 +995,15 @@ program
   });
 
 program
-  .command("forget <match>")
+  .command("forget [match]")
   .description("Drop failed jobs without retrying (use --all for everything)")
   .helpGroup(GROUP.queue)
-  .action((match: string) => {
-    const n = workerFrom(config()).forgetFailed(match);
+  .option("--all", "drop every failed job", false)
+  .action((match: string | undefined, opts: { all: boolean }) => {
+    if (!match && !opts.all) {
+      ui.fail("name the failed jobs to drop", "codeindex-sync forget <match>, or --all for every one");
+    }
+    const n = workerFrom(config()).forgetFailed(opts.all ? undefined : match);
     if (n) ui.ok(`dropped ${n} job(s)`);
     else ui.empty("no failed jobs matched");
   });
@@ -1171,6 +1191,12 @@ function age(iso: string | undefined): string {
   return `${Math.round(hours / 24)}d`;
 }
 
+/** An error for a table cell: its first line, cut to fit. */
+function oneLine(text: string, max = 96): string {
+  const first = text.split("\n").find((l) => l.trim())?.trim() ?? "";
+  return first.length > max ? `${first.slice(0, max - 1)}\u2026` : first;
+}
+
 /**
  * Shorten a path for display: $HOME becomes ~, and anything still too long
  * keeps its tail, which is the part that identifies the repo.
@@ -1195,9 +1221,7 @@ async function collectProjects(
 ): Promise<{ rows: ProjectRow[]; unsupported: string[] }> {
   const paths = resolvePaths();
   const queued = new Set(new Queue(paths.queue).list().map((j) => path.resolve(j.repoPath)));
-  const running = new Set(
-    new Queue(paths.processing).list().map((j) => path.resolve(j.repoPath)),
-  );
+  const running = new Set(runningJobs(paths.processing).map((j) => path.resolve(j.repoPath)));
 
   const rows: ProjectRow[] = [];
   const unsupported: string[] = [];
@@ -1856,6 +1880,10 @@ function withDefaultCommand(argv: string[]): string[] {
 }
 
 program.showSuggestionAfterError(true);
+
+// Backends run in their own process groups; an interrupted command must take
+// them down with it rather than leave them running, holding their locks.
+forwardSignalsToBackends();
 
 program.parseAsync(withDefaultCommand(process.argv)).catch((err: unknown) => {
   ui.fail(err instanceof Error ? err.message : String(err));

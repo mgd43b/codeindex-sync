@@ -132,6 +132,7 @@ describe("parseConfig", () => {
             detectFiles: [".marker"],
             busyMarkers: ["busy"],
             timeoutMs: 1234,
+            killAfterMs: 180000,
             env: { FOO: "bar" },
           },
         ],
@@ -140,7 +141,49 @@ describe("parseConfig", () => {
     const p = cfg.providers[0];
     expect(p?.detectFiles).toEqual([".marker"]);
     expect(p?.timeoutMs).toBe(1234);
+    expect(p?.killAfterMs).toBe(180000);
     expect(p?.env).toEqual({ FOO: "bar" });
+  });
+});
+
+describe("provider timers", () => {
+  const load = (field: Record<string, unknown>) =>
+    parseConfig(JSON.stringify({ providers: [{ name: "x", command: "y", tools: { update: "u" }, ...field }] }));
+
+  const rejects = (field: Record<string, unknown>, key: string): ConfigError => {
+    try {
+      load(field);
+    } catch (err) {
+      expect(err).toBeInstanceOf(ConfigError);
+      expect((err as ConfigError).message).toContain(key);
+      return err as ConfigError;
+    }
+    return expect.unreachable();
+  };
+
+  it.each(["timeoutMs", "killAfterMs"])("rejects a zero or negative %s at load", (key) => {
+    // Zero or less fails every call at once, or kills every backend the moment
+    // it is asked to stop. (NaN cannot survive JSON; it arrives as null.)
+    for (const value of [0, -1]) rejects({ [key]: value }, key);
+  });
+
+  it.each(["pollIntervalMs", "timeoutMs", "killAfterMs"])(
+    "rejects a %s longer than Node's timers can wait, which would fire after 1ms",
+    (key) => {
+      expect(rejects({ [key]: 9_999_999_999 }, key).remedy).toContain("2147483647");
+      expect(() => load({ [key]: 2_147_483_647 })).not.toThrow();
+    },
+  );
+
+  it("rejects a killAfterMs that is not a number", () => {
+    rejects({ killAfterMs: "75000" }, "killAfterMs");
+  });
+
+  it("still ignores a timeoutMs that is not a number, as it always has", () => {
+    // Rejecting it now would stop indexing for a config that works, and hooks
+    // discard the error, so nobody would see why.
+    expect(load({ timeoutMs: "3600000" }).providers[0]?.timeoutMs).toBeUndefined();
+    expect(load({ timeoutMs: null }).providers[0]?.timeoutMs).toBeUndefined();
   });
 });
 

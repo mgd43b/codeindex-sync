@@ -4,7 +4,8 @@
  * One file per repository, named from the repo path with every unsafe character
  * replaced. Re-enqueuing a repo therefore *overwrites* its pending job rather
  * than stacking duplicates, so a burst of Git commands collapses into a single
- * sync. Writes go to a temp file and are renamed into place: rename is atomic on
+ * sync — except that a pending full reindex stays full: a hook firing behind it
+ * must not quietly downgrade it to an incremental. Writes go to a temp file and are renamed into place: rename is atomic on
  * POSIX, so a half-written job is never readable by a concurrent drain.
  */
 import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
@@ -16,12 +17,15 @@ export interface Job {
   hook: string;
   /** ISO-8601 UTC. Compared against the last index start to drop redundant work. */
   enqueuedAt: string;
-  /** Force complete re-discovery. Never coalesced away. */
+  /** Force complete re-discovery. Never coalesced away, and never downgraded by a re-enqueue. */
   full: boolean;
   attempts: number;
 }
 
-/** Must match the hook dispatcher's key derivation, or jobs will not collapse. */
+/**
+ * The on-disk name for a repository's job. Must stay stable across versions, or
+ * jobs already queued by an older version will not collapse with new ones.
+ */
 export function jobKey(repoPath: string): string {
   return repoPath.replace(/[^A-Za-z0-9._-]/g, "_");
 }
@@ -31,7 +35,7 @@ export function nowIso(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-function serialise(job: Job): string {
+export function serialiseJob(job: Job): string {
   const lines = [
     `repo_path=${job.repoPath}`,
     `hook=${job.hook}`,
@@ -88,10 +92,19 @@ export class Queue {
       attempts: input.attempts ?? 0,
     };
     const target = this.fileFor(job.repoPath);
+    if (!job.full) job.full = this.pending(target)?.full ?? false;
     const tmp = `${target}.tmp.${process.pid}`;
-    writeFileSync(tmp, serialise(job), "utf8");
+    writeFileSync(tmp, serialiseJob(job), "utf8");
     renameSync(tmp, target);
     return job;
+  }
+
+  private pending(file: string): Job | null {
+    try {
+      return parseJob(readFileSync(file, "utf8"));
+    } catch {
+      return null;
+    }
   }
 
   list(): Job[] {

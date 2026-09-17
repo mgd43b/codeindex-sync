@@ -64,10 +64,10 @@ behaviour here comes from a failure seen in production:
 | `doctor` | Diagnose config, hooks and backend health — every problem carries a remedy |
 | `status` | Queue, worker and failures |
 | `list [repo] [--all] [--stale] [--json]` | What the backend holds — one repo, or every index with status, age and file counts |
-| `sync [repo] [--full]` | Index now |
+| `sync [repo] [--full]` | Index now, retrying a failure up to `maxAttempts` times |
 | `verify [repo] [--repair]` | Compare what an index claims to hold against what it actually holds |
 | `drain` / `once` | Process the queue |
-| `retry` / `forget` | Manage failed jobs |
+| `retry` / `forget [--all]` | Requeue or drop jobs that used up their attempts |
 | `unlock [--force]` | Release a stale worker lock |
 | `providers [--example]` | Configured providers and available presets |
 | `worktrees [--prune\|--gone]` | Inspect worktrees; drop dangling registrations or merged ones |
