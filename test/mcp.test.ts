@@ -560,7 +560,11 @@ child.on("exit", (code) => process.exit(code ?? 0));
     expect(Date.now() - t0).toBeGreaterThanOrEqual(600);
     expect(Date.now() - t0).toBeLessThan(5_000);
     expect(session.forcedKill).toBe(false);
-    expect(isAlive(Number(readFileSync(pidFile, "utf8")))).toBe(false);
+    // Gone, but the shell's orphan is init's to reap, not ours: until it is,
+    // its pid still answers a signal 0.
+    const backend = Number(readFileSync(pidFile, "utf8"));
+    for (let i = 0; i < 50 && isAlive(backend); i++) await new Promise((r) => setTimeout(r, 20));
+    expect(isAlive(backend)).toBe(false);
   });
 
   it("signals a backend behind a forwarding launcher once, so its graceful shutdown runs", async () => {
