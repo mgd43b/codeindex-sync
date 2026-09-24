@@ -22,6 +22,7 @@
  */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 
+import type { BackendLogLevel } from "./provider.js";
 import { VERSION } from "./version.js";
 
 export interface McpToolResult {
@@ -154,6 +155,88 @@ export interface McpClientOptions {
   timeoutMs?: number;
   /** See {@link DEFAULT_KILL_AFTER_MS}. */
   killAfterMs?: number;
+  /**
+   * Receives the backend's log lines, which are otherwise dropped.
+   *
+   * A server that declares the `logging` capability sends its log as
+   * `notifications/message` on stdout — the one channel a stdio client reads —
+   * and it may do so at any point: before its `initialize` reply, between
+   * calls, while it shuts down. No `logging/setLevel` is ever sent, so what
+   * arrives is whatever the backend's own configured level lets through.
+   *
+   * Must not throw. If it does, that line is lost and the session carries on.
+   */
+  onLog?: (message: McpLogMessage) => void;
+}
+
+/** A log line a backend sent as an MCP `notifications/message`. */
+export interface McpLogMessage {
+  level: BackendLogLevel;
+  /** The backend's name for the logger that wrote it, when it gave one. */
+  logger?: string;
+  /** The message as one bounded line; see {@link parseLogMessage}. */
+  text: string;
+}
+
+/**
+ * MCP's levels are syslog's eight (RFC 5424), finer than anyone reading a sync
+ * log acts on: `notice` is information, and `critical`, `alert` and
+ * `emergency` are errors.
+ */
+const MCP_LOG_LEVELS: ReadonlyMap<string, BackendLogLevel> = new Map([
+  ["debug", "debug"],
+  ["info", "info"],
+  ["notice", "info"],
+  ["warning", "warn"],
+  ["error", "error"],
+  ["critical", "error"],
+  ["alert", "error"],
+  ["emergency", "error"],
+]);
+
+/**
+ * Longest backend log line kept, in characters. Room for a message followed by
+ * the JSON context of a storage error; not room for a backend that dumps a
+ * whole payload into one line to flood a log that is rotated by size.
+ */
+export const MAX_LOG_LINE = 2_000;
+
+/** Longest logger name kept. A name, not a message. */
+const MAX_LOGGER_NAME = 100;
+
+/**
+ * One line, at most `max` characters. The log is read line by line, and a
+ * continuation line would carry no timestamp and no label. A cut says how much
+ * it cut rather than cutting silently.
+ */
+function oneLine(text: string, max: number): string {
+  const flat = text.trim().replace(/\s*[\r\n]+\s*/g, " | ");
+  if (flat.length <= max) return flat;
+  // Never end on the first half of a surrogate pair.
+  const cut = /[\uD800-\uDBFF]/.test(flat.charAt(max - 1)) ? max - 1 : max;
+  return `${flat.slice(0, cut)}… [${flat.length - cut} more chars]`;
+}
+
+/**
+ * Read a `notifications/message`'s params, or null when there is nothing to log.
+ *
+ * `data` may be any JSON value. A string is kept as written and anything else
+ * is written as JSON. A level outside MCP's eight is logged as info rather than
+ * dropped: the line is still worth seeing, and guessing it more severe would
+ * cry wolf. Never throws, whatever the backend sent.
+ */
+export function parseLogMessage(params: unknown): McpLogMessage | null {
+  if (typeof params !== "object" || params === null || Array.isArray(params)) return null;
+  const { level, logger, data } = params as Record<string, unknown>;
+  if (data === undefined) return null;
+  const text = oneLine(typeof data === "string" ? data : JSON.stringify(data), MAX_LOG_LINE);
+  if (!text) return null;
+  const name = typeof logger === "string" ? oneLine(logger, MAX_LOGGER_NAME) : "";
+  return {
+    level: (typeof level === "string" && MCP_LOG_LEVELS.get(level.toLowerCase())) || "info",
+    ...(name ? { logger: name } : {}),
+    text,
+  };
 }
 
 interface JsonRpcMessage {
@@ -309,13 +392,34 @@ export class McpSession {
       } catch {
         continue; // Servers may log non-JSON to stdout; ignore rather than die.
       }
-      if (typeof msg.id === "number") {
-        const resolve = this.pending.get(msg.id);
-        if (resolve) {
-          this.pending.delete(msg.id);
-          resolve(msg);
+      // `null` or `42` is JSON but no message, and reading a field of null throws.
+      if (typeof msg !== "object" || msg === null) continue;
+      if (msg.method === undefined) {
+        if (typeof msg.id === "number") {
+          const resolve = this.pending.get(msg.id);
+          if (resolve) {
+            this.pending.delete(msg.id);
+            resolve(msg);
+          }
         }
+      } else if (msg.method === "notifications/message") {
+        this.onLogMessage(msg.params);
       }
+      // Anything else with a method — another notification, or a request from
+      // the server — is ignored. It is never a response, whatever id it carries:
+      // taking one for the reply to a pending call would answer that call with
+      // nothing.
+    }
+  }
+
+  private onLogMessage(params: unknown): void {
+    const onLog = this.opts.onLog;
+    if (!onLog) return;
+    try {
+      const message = parseLogMessage(params);
+      if (message) onLog(message);
+    } catch {
+      // A log line is never worth a response: this loop is what delivers them.
     }
   }
 

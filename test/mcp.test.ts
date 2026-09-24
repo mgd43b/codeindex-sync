@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { isAlive } from "../src/lock.js";
-import { McpSession, withMcp } from "../src/mcp.js";
+import { MAX_LOG_LINE, McpSession, parseLogMessage, withMcp, type McpLogMessage } from "../src/mcp.js";
 
 let dir: string;
 beforeEach(() => {
@@ -174,6 +174,210 @@ describe("fast failure", () => {
     const elapsed = Date.now() - t0;
     expect(res.isError).toBe(true);
     expect(elapsed).toBeLessThan(2_000);
+  });
+});
+
+describe("backend log messages", () => {
+  // A server declaring the `logging` capability sends its log on stdout as
+  // `notifications/message`. These used to be read and thrown away, and with
+  // them the backend's own account of why a sync failed.
+
+  /** A JS expression, for a stub, that sends one log notification. */
+  const log = (params: unknown): string =>
+    `send({ jsonrpc: "2.0", method: "notifications/message", params: ${JSON.stringify(params)} });`;
+
+  /** A stub that runs `beforeReply` inside its tools/call handler, then answers "ok". */
+  const loggingDuringCall = (beforeReply: string): string =>
+    stubServer(`
+function handle(msg) {
+  if (msg.method === "initialize") return send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  if (msg.method === "tools/call") {
+    ${beforeReply}
+    return send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "ok" }] } });
+  }
+}
+`);
+
+  /** Everything one session logs, and the tool call's result. */
+  async function callLogging(server: string): Promise<{ got: McpLogMessage[]; text: string }> {
+    const got: McpLogMessage[] = [];
+    const res = await withMcp(
+      { command: NODE, args: [server], cwd: dir, timeoutMs: 15_000, onLog: (m) => got.push(m) },
+      (s) => s.callTool("x", {}),
+    );
+    return { got, text: res.text };
+  }
+
+  it("delivers a line sent before the initialize reply, and the handshake still completes", async () => {
+    // A backend logs while it starts, before it has answered anything:
+    // SocratiCode 1.15.0 sends two lines ahead of its initialize reply.
+    const server = stubServer(`
+${log({ level: "warning", logger: "stub", data: "config entry ignored" })}
+function handle(msg) {
+  if (msg.method === "initialize") {
+    ${log({ level: "info", data: "connected" })}
+    return send({ jsonrpc: "2.0", id: msg.id, result: {} });
+  }
+  if (msg.method === "tools/call") {
+    ${log({ level: "error", data: "storage said no" })}
+    return send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "ok" }] } });
+  }
+}
+`);
+    const got: McpLogMessage[] = [];
+    const session = new McpSession({ command: NODE, args: [server], cwd: dir, onLog: (m) => got.push(m) });
+    try {
+      await session.open();
+      expect(got).toEqual([
+        { level: "warn", logger: "stub", text: "config entry ignored" },
+        { level: "info", text: "connected" },
+      ]);
+      const res = await session.callTool("x", {});
+      expect(res).toEqual({ isError: false, text: "ok" });
+      expect(got.at(-1)).toEqual({ level: "error", text: "storage said no" });
+    } finally {
+      await session.close();
+    }
+  });
+
+  it("maps MCP's eight levels onto debug, info, warn and error", async () => {
+    const sent = ["debug", "info", "notice", "warning", "error", "critical", "alert", "emergency"];
+    const { got } = await callLogging(loggingDuringCall(sent.map((level) => log({ level, data: level })).join("\n")));
+    expect(got.map((m) => [m.text, m.level])).toEqual([
+      ["debug", "debug"],
+      ["info", "info"],
+      ["notice", "info"],
+      ["warning", "warn"],
+      ["error", "error"],
+      ["critical", "error"],
+      ["alert", "error"],
+      ["emergency", "error"],
+    ]);
+  });
+
+  it("logs a line whose level it does not recognise as info rather than dropping it", async () => {
+    const { got } = await callLogging(
+      loggingDuringCall(
+        [
+          log({ level: "WARNING", data: "shouted" }),
+          log({ level: "verbose", data: "unknown level" }),
+          log({ data: "no level at all" }),
+          log({ level: { nested: true }, data: "level is not a string" }),
+        ].join("\n"),
+      ),
+    );
+    expect(got.map((m) => [m.text, m.level])).toEqual([
+      ["shouted", "warn"],
+      ["unknown level", "info"],
+      ["no level at all", "info"],
+      ["level is not a string", "info"],
+    ]);
+  });
+
+  it("writes data that is not a string as JSON, on one line", async () => {
+    // `data` may be any JSON value; the log is read line by line.
+    const { got } = await callLogging(
+      loggingDuringCall(
+        [
+          log({ level: "error", data: { error: "upsert failed", status: 500 } }),
+          log({ level: "info", data: 42 }),
+          log({ level: "info", data: null }),
+          log({ level: "info", data: false }),
+          log({ level: "info", data: ["a", 1] }),
+          log({ level: "error", data: "first line\n  at frame one\r\n  at frame two\n" }),
+        ].join("\n"),
+      ),
+    );
+    expect(got.map((m) => m.text)).toEqual([
+      '{"error":"upsert failed","status":500}',
+      "42",
+      "null",
+      "false",
+      '["a",1]',
+      "first line | at frame one | at frame two",
+    ]);
+  });
+
+  it("caps an absurdly long line, saying how much it cut", async () => {
+    const { got } = await callLogging(loggingDuringCall(log({ level: "info", data: "x".repeat(MAX_LOG_LINE + 500) })));
+    expect(got).toHaveLength(1);
+    expect(got[0]!.text).toBe(`${"x".repeat(MAX_LOG_LINE)}… [500 more chars]`);
+  });
+
+  it("carries on answering calls whatever arrives on stdout between them", async () => {
+    // Nothing a backend writes may cost a response: not a malformed
+    // notification, not a bare JSON value, and not a notification that carries
+    // the id of the very call waiting for a reply.
+    const { got, text } = await callLogging(
+      loggingDuringCall(`
+process.stdout.write("null\\n42\\n\\"a string\\"\\n[1,2]\\n");
+send({ jsonrpc: "2.0", method: "notifications/message" });
+send({ jsonrpc: "2.0", method: "notifications/message", params: "just text" });
+send({ jsonrpc: "2.0", method: "notifications/message", params: [1, 2] });
+send({ jsonrpc: "2.0", method: "notifications/message", params: { level: "error" } });
+send({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "   " } });
+send({ jsonrpc: "2.0", id: msg.id, method: "notifications/message", params: { level: "warning", data: "has an id" } });
+send({ jsonrpc: "2.0", id: msg.id, method: "roots/list" });
+send({ jsonrpc: "2.0", method: "notifications/progress", params: { progressToken: 1, progress: 5 } });
+${log({ level: "info", data: "still logging" })}`),
+    );
+    expect(text).toBe("ok");
+    expect(got).toEqual([
+      { level: "warn", text: "has an id" },
+      { level: "info", text: "still logging" },
+    ]);
+  });
+
+  it("survives a log sink that throws", async () => {
+    const server = loggingDuringCall(`${log({ level: "info", data: "one" })}\n${log({ level: "info", data: "two" })}`);
+    const seen: string[] = [];
+    const res = await withMcp(
+      {
+        command: NODE,
+        args: [server],
+        cwd: dir,
+        timeoutMs: 15_000,
+        onLog: (m) => {
+          seen.push(m.text);
+          throw new Error("sink is broken");
+        },
+      },
+      (s) => s.callTool("x", {}),
+    );
+    expect(res).toEqual({ isError: false, text: "ok" });
+    expect(seen).toEqual(["one", "two"]);
+  });
+
+  it("drops the lines when nobody asked for them, as before", async () => {
+    const server = loggingDuringCall(log({ level: "error", data: "unheard" }));
+    const res = await withMcp({ command: NODE, args: [server], cwd: dir, timeoutMs: 15_000 }, (s) => s.callTool("x", {}));
+    expect(res).toEqual({ isError: false, text: "ok" });
+  });
+});
+
+describe("parseLogMessage", () => {
+  it("is null for params that carry nothing to log", () => {
+    for (const params of [undefined, null, "text", 3, [1], {}, { level: "info" }, { data: "" }, { data: " \n " }]) {
+      expect(parseLogMessage(params)).toBeNull();
+    }
+  });
+
+  it("keeps the logger's name, on one bounded line", () => {
+    expect(parseLogMessage({ level: "info", logger: "indexer", data: "hi" })).toEqual({
+      level: "info",
+      logger: "indexer",
+      text: "hi",
+    });
+    expect(parseLogMessage({ logger: "a\nb", data: "hi" })?.logger).toBe("a | b");
+    expect(parseLogMessage({ logger: "n".repeat(500), data: "hi" })?.logger).toMatch(/^n{100}… \[400 more chars]$/);
+    expect(parseLogMessage({ logger: 7, data: "hi" })).toEqual({ level: "info", text: "hi" });
+  });
+
+  it("never cuts a character in half", () => {
+    // "😀" is two UTF-16 units; a cut between them leaves a lone surrogate,
+    // which is written to the log as a replacement character.
+    const text = parseLogMessage({ data: `${"x".repeat(MAX_LOG_LINE - 1)}😀tail` })!.text;
+    expect(text).toBe(`${"x".repeat(MAX_LOG_LINE - 1)}… [6 more chars]`);
   });
 });
 

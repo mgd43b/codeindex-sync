@@ -5,6 +5,8 @@ export { shouldCoalesce } from "./coalesce.js";
 export type { CoalesceDecision } from "./coalesce.js";
 export { ProviderRegistry } from "./provider.js";
 export type {
+  BackendLogLevel,
+  BackendLogLine,
   IndexOutcome,
   IndexProvider,
   IndexReason,

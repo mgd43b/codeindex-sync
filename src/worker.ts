@@ -277,6 +277,7 @@ export class Worker {
     );
 
     const marker = markerFile(this.opts.paths.processing, job.repoPath);
+    const backend = provider.name;
     let result: IndexOutcome;
     try {
       try {
@@ -288,6 +289,10 @@ export class Worker {
         repoPath: job.repoPath,
         full: job.full,
         reason: job.attempts > 0 ? "retry" : job.hook === "manual" ? "manual" : "hook",
+        // Everything the backend logs, as it sent it: the backend filters by its
+        // own configured level, and this log has no level of its own to add a
+        // second, disagreeing filter. `[name:level]` keeps it greppable both ways.
+        log: (line) => logger.tag(`${backend}:${line.level}`, line.message),
       });
     } finally {
       rmSync(marker, { force: true });
