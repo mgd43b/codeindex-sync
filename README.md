@@ -143,7 +143,9 @@ in the worker, the abstraction has leaked.
   root would mean a tree walk on every commit.) Add a directory to `excludePaths`
   when a new tool appears; no release needed.
 - **The log is the diagnostic.** Append-only, rotated not truncated, and writing
-  to it never throws.
+  to it never throws. It also carries whatever the backend logs during an index
+  run (MCP `notifications/message`), as `[<provider>:<level>]` lines, since a
+  backend's own account of a failure is usually more specific than its reply.
 - **`verify` is the one deliberate exception.** Every other command drives a
   backend through the MCP tools it declares. Integrity has no such tool to call
   — "which files does this index claim, and which have content?" is answerable

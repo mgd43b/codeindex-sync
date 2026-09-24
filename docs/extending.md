@@ -183,6 +183,23 @@ advice, built from your `detectFiles`.
 invisible to the indexer. If your backend needs configuration, it goes here or in
 a file the hook path reads directly — never in a shell profile.
 
+**Your backend's log lands in the worker log.** A server that declares the MCP
+`logging` capability sends its log lines as `notifications/message`, and every
+one it sends during an index run is written to the log, and to the output of
+`sync`, `drain` and `once`, as `[<name>:<level>] <message>`. MCP's eight levels
+become four: `debug`; `info` (and `notice`); `warn`; `error` (and `critical`,
+`alert`, `emergency`). A level it does not recognise is logged as `info`. Data
+that is not a string is written as JSON, line breaks become ` | `, and a line is
+capped at 2,000 characters, with a note of how much was cut. The backend's
+`logger` name is added in front of the message when it differs from the
+provider's `name`.
+
+Nothing is filtered here: codeindex-sync has no verbosity setting of its own, so
+the backend's configured log level decides what arrives, and no
+`logging/setLevel` is sent to override it. Lines can arrive at any point in a
+session, including before the backend answers `initialize`. Only index runs are
+logged, so `list`, `doctor` and `cleanup` drop them as before.
+
 ### One thing config cannot describe: integrity
 
 `codeindex-sync verify` is the single command that does not go through the
@@ -232,6 +249,12 @@ Three rules, each learned from a production failure:
 - **`health` must never throw.** It backs `doctor`, which has to work when
   everything else is broken. Return `ok: false` with a `remedy` instead.
 - **Distinguish `busy` from `failed`.** See above.
+
+If your backend keeps a log of its own, pass it on through `req.log`, one line
+at a time: `req.log?.({ level: "warn", message: "…" })`, where `level` is
+`debug`, `info`, `warn` or `error`. The worker writes it as
+`[<name>:<level>] <message>`. Keep each message to one line; the log is read
+line by line.
 
 ---
 

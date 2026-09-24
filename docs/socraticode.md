@@ -426,6 +426,22 @@ reindex clears it: `codeindex-sync sync --full`.
 or at once for a run whose SocratiCode process had to be killed. `codeindex-sync status` shows them and the last error;
 `codeindex-sync retry` requeues them, a full reindex still full.
 
+**Why did it fail? Read the `[socraticode:…]` lines.** From 1.15.0, SocratiCode
+sends its own log over MCP, and codeindex-sync writes each line to its log and to
+the output of `sync`, `drain` and `once`, labelled with the provider's `name` and
+the level:
+
+```
+2026-09-24T13:59:48Z [socraticode:warn] EXTENSION_LANGUAGE_MAP: ignored invalid entries. … {"ignored":[".foo:nolanguage"]}
+```
+
+The detail behind a one-line `failed —`, such as a storage error's reason or a
+warning about one file, is often only there. What arrives is SocratiCode's
+choice, set by `SOCRATICODE_LOG_LEVEL` in the provider's `env` block (default
+`info`). `warn` keeps only warnings and errors, for when a large reindex's info
+lines crowd a log that rotates at 2 MB (`logMaxBytes`), keeping one previous
+file as `sync.log.1`.
+
 **`sync` pauses for up to a minute after a failure.** Before it retries,
 codeindex-sync waits for the previous SocratiCode process to exit, and SocratiCode
 lets its in-flight batch finish first — for up to 60 seconds. A retry started
