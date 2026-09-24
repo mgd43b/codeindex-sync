@@ -14,6 +14,20 @@
 /** Why an index ran, which providers may use to pick a cheaper path. */
 export type IndexReason = "hook" | "manual" | "retry";
 
+/**
+ * How much one of a backend's own log lines matters. Backends grade more
+ * finely — MCP has eight levels — and a provider coarsens to these four, the
+ * distinctions a reader of the log actually acts on.
+ */
+export type BackendLogLevel = "debug" | "info" | "warn" | "error";
+
+/** One line from a backend's own log. */
+export interface BackendLogLine {
+  level: BackendLogLevel;
+  /** A single line, already bounded in length: the log is read line by line. */
+  message: string;
+}
+
 export interface IndexRequest {
   repoPath: string;
   /** Force complete re-discovery rather than an incremental update. */
@@ -24,6 +38,14 @@ export interface IndexRequest {
    * the provider's own session timeout to stop a hung backend.
    */
   signal?: AbortSignal;
+  /**
+   * Takes whatever the backend logs while this index runs. The worker writes
+   * each line to its own log, labelled with the provider's name and the level,
+   * because a backend's account of a failure — a storage error's reason, a
+   * warning about one file — is usually more specific than its tool's reply.
+   * A provider whose backend reports nothing ignores it.
+   */
+  log?: (line: BackendLogLine) => void;
 }
 
 export interface IndexOutcome {

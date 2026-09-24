@@ -590,6 +590,46 @@ describe("sync", () => {
     expect(second.code).toBe(0);
   });
 
+  it("prints what the backend logs and keeps it in the log", () => {
+    // A backend declaring MCP logging sends its log lines as notifications,
+    // some before it has answered initialize. `sync` is run by hand and from
+    // scripts whose output is captured, and `drain` from a scheduler, so the
+    // lines belong on stdout and in the log alike.
+    const file = path.join(home, "logging-server.mjs");
+    writeFileSync(
+      file,
+      `const send=(o)=>process.stdout.write(JSON.stringify(o)+"\\n");
+       const log=(level,data)=>send({jsonrpc:"2.0",method:"notifications/message",params:{level,logger:"stub",data}});
+       log("warning","EXTRA_MAP: ignored invalid entries");
+       let buf="";process.stdin.on("data",c=>{buf+=c;let n;while((n=buf.indexOf("\\n"))!==-1){const l=buf.slice(0,n).trim();buf=buf.slice(n+1);if(!l)continue;const m=JSON.parse(l);
+       if(m.method==="initialize")send({jsonrpc:"2.0",id:m.id,result:{}});
+       if(m.method==="tools/call"){log("info",{indexed:1});send({jsonrpc:"2.0",id:m.id,result:{content:[{type:"text",text:"Updated project index"}]}});}}});`,
+      "utf8",
+    );
+    writeConfig({
+      root: home,
+      providers: [
+        { name: "stub", command: process.execPath, args: [file], tools: { update: "u" }, detectFiles: [".stub.json"] },
+      ],
+    });
+    const dir = path.join(home, "chatty");
+    mkdirSync(dir, { recursive: true });
+    git(dir, "init", "-q", "-b", "main");
+    git(dir, "config", "user.email", "t@example.com");
+    git(dir, "config", "user.name", "Test");
+    writeFileSync(path.join(dir, ".stub.json"), '{"projectId":"chatty"}\n', "utf8");
+    git(dir, "add", "-A");
+    git(dir, "commit", "-q", "-m", "init");
+
+    const r = cli(["sync", dir]);
+    expect(r.code).toBe(0);
+    const log = readFileSync(path.join(state, "sync.log"), "utf8");
+    for (const text of [r.out, log]) {
+      expect(text).toMatch(/ \[stub:warn\] EXTRA_MAP: ignored invalid entries\n/);
+      expect(text).toMatch(/ \[stub:info\] \{"indexed":1\}\n/);
+    }
+  });
+
   /**
    * A backend whose first `failures` tool calls report an error, recording each
    * call and each exit with its pid and time. State lives in a file because every

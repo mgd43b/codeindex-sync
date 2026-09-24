@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { silentLogger } from "../src/logger.js";
+import { Logger, silentLogger } from "../src/logger.js";
 import { resolvePaths } from "../src/paths.js";
 import { ProviderRegistry, type IndexOutcome, type IndexProvider } from "../src/provider.js";
 import { Queue, jobKey, nowIso } from "../src/queue.js";
@@ -172,6 +172,34 @@ describe("Worker.runJob", () => {
       },
     });
     expect((await w.runJob(enqueue())).outcome).toBe("indexed");
+  });
+
+  it("writes the backend's own log lines to the log, labelled with provider and level", async () => {
+    // The reason a run failed is often only in what the backend logged.
+    const provider: IndexProvider = {
+      ...fakeProvider({ status: "failed", summary: "", error: "Indexing failed" }, "backend"),
+      index: async (req) => {
+        req.log?.({ level: "info", message: "indexing 3 files" });
+        req.log?.({ level: "error", message: 'upsert rejected {"status":400}' });
+        return { status: "failed", summary: "", error: "Indexing failed" };
+      },
+    };
+    const paths = resolvePaths(state);
+    const w = new Worker({
+      paths,
+      registry: new ProviderRegistry().register(provider),
+      logger: new Logger(paths.log),
+      maxAttempts: 1,
+      sleep: async () => {},
+    });
+    await w.runJob(enqueue());
+
+    const lines = readFileSync(paths.log, "utf8").split("\n");
+    const at = (pattern: RegExp): number => lines.findIndex((l) => pattern.test(l));
+    expect(at(/ \[start\] /)).toBeGreaterThanOrEqual(0);
+    expect(at(/ \[backend:info\] indexing 3 files$/)).toBeGreaterThan(at(/ \[start\] /));
+    expect(at(/ \[backend:error\] upsert rejected \{"status":400\}$/)).toBeGreaterThan(at(/ \[backend:info\] /));
+    expect(at(/ \[give-up\] .*Indexing failed/)).toBeGreaterThan(at(/ \[backend:error\] /));
   });
 });
 

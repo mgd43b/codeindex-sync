@@ -39,10 +39,12 @@ import {
   DEFAULT_TIMEOUT_MS,
   withMcp,
   type McpClientOptions,
+  type McpLogMessage,
   type McpSession,
   type McpToolResult,
 } from "../mcp.js";
 import type {
+  BackendLogLine,
   IndexOutcome,
   IndexProvider,
   IndexRequest,
@@ -390,8 +392,14 @@ export class McpIndexProvider implements IndexProvider {
    *
    * Set after process.env so an ambient value cannot re-enable it, and before
    * cfg.env so an operator still can.
+   *
+   * `log`, when given, takes the backend's own log lines for the session.
    */
-  private sessionOpts(repoPath: string | undefined, timeoutMs: number | undefined): McpClientOptions {
+  private sessionOpts(
+    repoPath: string | undefined,
+    timeoutMs: number | undefined,
+    log?: IndexRequest["log"],
+  ): McpClientOptions {
     return {
       command: this.cfg.command,
       args: this.cfg.args,
@@ -399,7 +407,18 @@ export class McpIndexProvider implements IndexProvider {
       env: { ...process.env, SOCRATICODE_AUTO_RESUME: "off", ...this.cfg.env },
       ...(timeoutMs === undefined ? {} : { timeoutMs }),
       ...(this.cfg.killAfterMs === undefined ? {} : { killAfterMs: this.cfg.killAfterMs }),
+      ...(log ? { onLog: (m: McpLogMessage) => log(this.logLine(m)) } : {}),
     };
+  }
+
+  /**
+   * A backend log message as a line for the worker log, which labels it with
+   * this provider's name. The backend's own logger name is kept only when it
+   * says something that label does not.
+   */
+  private logLine(m: McpLogMessage): BackendLogLine {
+    const from = m.logger && m.logger.toLowerCase() !== this.name.toLowerCase() ? `${m.logger}: ` : "";
+    return { level: m.level, message: `${from}${m.text}` };
   }
 
   private async call(
@@ -420,7 +439,7 @@ export class McpIndexProvider implements IndexProvider {
       // finished. Not two: a backend's progress state is per-process, so a
       // second child sees a backend that has never indexed anything.
       res = await withMcp(
-        this.sessionOpts(req.repoPath, this.cfg.timeoutMs),
+        this.sessionOpts(req.repoPath, this.cfg.timeoutMs, req.log),
         async (session) => {
           used = session;
           const started = await session.callTool(tool, this.repoArgs(req.repoPath));
