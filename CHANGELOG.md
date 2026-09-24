@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/mgd43b/codeindex-sync/compare/v0.4.1...v0.5.0) (2026-09-24)
+
+
+### Features
+
+* **sync:** write a backend's own log lines to the worker log ([#44](https://github.com/mgd43b/codeindex-sync/issues/44)) ([4d0f18a](https://github.com/mgd43b/codeindex-sync/commit/4d0f18a43f9d413e258e06bf53c8fe9346a5925f))
+
 ## [0.4.1](https://github.com/mgd43b/codeindex-sync/compare/v0.4.0...v0.4.1) (2026-09-17)
 
 
