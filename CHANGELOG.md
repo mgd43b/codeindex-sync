@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/mgd43b/codeindex-sync/compare/v0.5.1...v0.5.2) (2026-10-22)
+
+
+### Bug Fixes
+
+* **deps:** bump @modelcontextprotocol/sdk ([#60](https://github.com/mgd43b/codeindex-sync/issues/60)) ([90f2bd3](https://github.com/mgd43b/codeindex-sync/commit/90f2bd3f2035b7feeda576b1746bfb8b406fb130))
+
 ## [0.5.1](https://github.com/mgd43b/codeindex-sync/compare/v0.5.0...v0.5.1) (2026-10-22)
 
 
