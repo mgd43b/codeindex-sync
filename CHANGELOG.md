@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/mgd43b/codeindex-sync/compare/v0.5.0...v0.5.1) (2026-10-22)
+
+
+### Bug Fixes
+
+* **deps:** release production dependency bumps ([#58](https://github.com/mgd43b/codeindex-sync/issues/58)) ([af18cd2](https://github.com/mgd43b/codeindex-sync/commit/af18cd20f5c375c1778c3f220c3adf67e00adc86))
+
 ## [0.5.0](https://github.com/mgd43b/codeindex-sync/compare/v0.4.1...v0.5.0) (2026-09-24)
 
 
