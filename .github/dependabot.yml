@@ -17,6 +17,14 @@ updates:
         update-types: [minor, patch]
     # Majors stay separate: they need a human to read the changelog.
     labels: [dependencies]
+    # Production bumps are releasable: release-please only cuts a release for
+    # feat/fix commits, so "build(deps)" would never ship a patched runtime
+    # dependency. Dev-only bumps change nothing users install, so they stay
+    # "build" and do not trigger a release.
+    commit-message:
+      prefix: fix
+      prefix-development: build
+      include: scope
     ignore:
       # @types/node must track the MINIMUM supported runtime (engines:
       # >=22.12), not the newest release. Newer types let tsc accept APIs that
