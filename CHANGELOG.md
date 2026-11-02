@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.4](https://github.com/mgd43b/codeindex-sync/compare/v0.5.3...v0.5.4) (2026-11-02)
+
+
+### Bug Fixes
+
+* **deps:** bump @hono/node-server from 2.1.1 to 2.1.6 ([#68](https://github.com/mgd43b/codeindex-sync/issues/68)) ([e9f810f](https://github.com/mgd43b/codeindex-sync/commit/e9f810fdefad9380727aa6c1c96dd4b757427ff2))
+* **deps:** bump zod from 4.4.3 to 4.6.7 ([#69](https://github.com/mgd43b/codeindex-sync/issues/69)) ([b6dfe67](https://github.com/mgd43b/codeindex-sync/commit/b6dfe67507bf5a7210ea9a602f0464550f9cea33))
+
 ## [0.5.3](https://github.com/mgd43b/codeindex-sync/compare/v0.5.2...v0.5.3) (2026-11-02)
 
 
