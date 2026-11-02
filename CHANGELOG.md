@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.5.3](https://github.com/mgd43b/codeindex-sync/compare/v0.5.2...v0.5.3) (2026-11-02)
+
+
+### Bug Fixes
+
+* **deps:** bump @modelcontextprotocol/sdk ([#63](https://github.com/mgd43b/codeindex-sync/issues/63)) ([ec70086](https://github.com/mgd43b/codeindex-sync/commit/ec70086faf43a8fdcc35f066be2beff937f9e1aa))
+* **deps:** bump body-parser from 2.3.0 to 2.4.0 ([#66](https://github.com/mgd43b/codeindex-sync/issues/66)) ([68531f2](https://github.com/mgd43b/codeindex-sync/commit/68531f2a672185a5441a0e9419311b6e00c1dcd8))
+* **deps:** bump fast-uri from 3.1.8 to 3.1.9 ([#64](https://github.com/mgd43b/codeindex-sync/issues/64)) ([f2cf34d](https://github.com/mgd43b/codeindex-sync/commit/f2cf34d88a7fdbc9b4299b5b8856e3ffbf4672d8))
+* **deps:** bump ip-address from 10.7.2 to 10.7.5 ([#65](https://github.com/mgd43b/codeindex-sync/issues/65)) ([f34613c](https://github.com/mgd43b/codeindex-sync/commit/f34613c36589dfa3200c0c9b310f6d9a3e53c8c2))
+
 ## [0.5.2](https://github.com/mgd43b/codeindex-sync/compare/v0.5.1...v0.5.2) (2026-10-22)
 
 
